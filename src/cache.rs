@@ -10,9 +10,9 @@ use std::{
 use tokio::{
     fs as tfs,
     io::AsyncWriteExt,
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
 };
-use tracing::{debug};
+use tracing::debug;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Meta {
@@ -236,8 +236,14 @@ impl DiskCache {
                             if bin.exists() {
                                 // 만료( + swr 종료) 된 항목은 즉시 삭제 후 스킵
                                 let fully_expired = if now > meta.expires_at {
-                                    if let Some(swr_end) = meta.swr_expires_at { now > swr_end } else { true }
-                                } else { false };
+                                    if let Some(swr_end) = meta.swr_expires_at {
+                                        now > swr_end
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    false
+                                };
                                 if fully_expired {
                                     let _ = tfs::remove_file(bin).await;
                                     let _ = tfs::remove_file(entry.path()).await;
@@ -296,7 +302,7 @@ impl DiskCache {
                 total = 0;
             }
         }
-    debug!(target: "cache", final_bytes=total, "eviction complete");
+        debug!(target: "cache", final_bytes=total, "eviction complete");
         Ok(())
     }
 

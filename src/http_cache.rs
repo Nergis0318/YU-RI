@@ -1,6 +1,6 @@
 use http::HeaderMap;
-use tracing::debug;
 use std::time::{Duration, SystemTime};
+use tracing::debug;
 
 /// 결과 TTL 및 캐시 여부 판단용
 #[derive(Debug, Clone, PartialEq, Eq)]

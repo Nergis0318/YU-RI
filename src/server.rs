@@ -81,7 +81,11 @@ pub async fn run(config: Config) -> Result<()> {
 
 async fn handle(
     req: Request<Body>,
-    shared: Arc<(Config, DiskCache, Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>)>,
+    shared: Arc<(
+        Config,
+        DiskCache,
+        Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+    )>,
 ) -> Result<Response<Body>, hyper::Error> {
     let (config, cache, client) = (&shared.0, &shared.1, &shared.2);
     if req.method() != http::Method::GET {
@@ -427,7 +431,11 @@ async fn handle(
 async fn background_refresh(
     cache_key: String,
     base_cache_key: String,
-    shared: Arc<(Config, DiskCache, Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>)>,
+    shared: Arc<(
+        Config,
+        DiskCache,
+        Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+    )>,
 ) -> Result<(), anyhow::Error> {
     let (_config, cache, client) = (&shared.0, &shared.1, &shared.2);
     // base_cache_key 로 재검증 (간단한 fresh fetch). 기존 variant 값은 유지 목적
@@ -454,13 +462,15 @@ async fn background_refresh(
                 let decision = derive_ttl(&headers, std::time::SystemTime::now());
                 if decision.cacheable {
                     // 기존 cache_key 덮어쓰기 (variant 유지)
-                    let _ = cache.put(
-                        &cache_key,
-                        &body_bytes,
-                        ct,
-                        decision.ttl,
-                        decision.stale_while_revalidate,
-                    ).await;
+                    let _ = cache
+                        .put(
+                            &cache_key,
+                            &body_bytes,
+                            ct,
+                            decision.ttl,
+                            decision.stale_while_revalidate,
+                        )
+                        .await;
                 }
             }
         }
