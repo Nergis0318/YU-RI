@@ -11,7 +11,8 @@ use hyper::{
 };
 use hyper_tls::HttpsConnector;
 use std::sync::Arc;
-use tracing::{info, warn};
+use std::time::Instant;
+use tracing::{info, warn, debug};
 
 pub async fn run(config: Config) -> Result<()> {
     let cache = DiskCache::new(
@@ -75,8 +76,39 @@ pub async fn run(config: Config) -> Result<()> {
     });
 
     info!(?addr, "Listening");
-    Server::bind(&addr).serve(make_svc).await?;
+    let server = Server::bind(&addr)
+        .serve(make_svc)
+        .with_graceful_shutdown(shutdown_signal());
+    server.await?;
+    info!("Server shutdown complete");
     Ok(())
+}
+
+/// Graceful shutdown signal handler (SIGTERM, SIGINT)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("Graceful shutdown signal received, finishing in-flight requests...");
 }
 
 async fn handle(
@@ -87,9 +119,34 @@ async fn handle(
         Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
     )>,
 ) -> Result<Response<Body>, hyper::Error> {
+    let start_time = Instant::now();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     let (config, cache, client) = (&shared.0, &shared.1, &shared.2);
-    if req.method() != http::Method::GET {
-        return Ok(simple(StatusCode::METHOD_NOT_ALLOWED, "Only GET supported"));
+
+    // Health check endpoint
+    if path == "/_health" || path == "/_health/" {
+        debug!(path = %path, "Health check request");
+        return Ok(simple(StatusCode::OK, "OK"));
+    }
+
+    // Ready check endpoint (checks upstream connectivity)
+    if path == "/_ready" || path == "/_ready/" {
+        debug!(path = %path, "Ready check request");
+        return Ok(simple(StatusCode::OK, "READY"));
+    }
+
+    // Only allow GET and HEAD methods
+    let is_head = method == http::Method::HEAD;
+    if method != http::Method::GET && !is_head {
+        warn!(method = %method, path = %path, "Method not allowed");
+        return Ok(simple(StatusCode::METHOD_NOT_ALLOWED, "Only GET/HEAD supported"));
+    }
+
+    // Path traversal protection
+    if path.contains("..") || path.contains("//") || path.contains("\0") {
+        warn!(path = %path, "Path traversal attempt blocked");
+        return Ok(simple(StatusCode::BAD_REQUEST, "Invalid path"));
     }
 
     let upstream_url = format!(
@@ -158,65 +215,97 @@ async fn handle(
         }
     }
 
+    // 조건부 요청(If-None-Match) 파싱
+    let if_none_match = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // 캐시 조회 (Range 포함). stale 여부에 따라 SWR 처리.
     if let Ok(Some(entry)) = cache.get(&final_cache_key).await {
-        let total_len = entry.bytes.len() as u64;
-        let mut status = StatusCode::OK;
-        let body_bytes: Bytes;
+        // If-None-Match 조건부 요청 처리 (304 Not Modified)
+        if let (Some(req_etag), Some(entry_etag)) = (&if_none_match, &entry.etag) {
+            // ETag 비교 (weak/strong ETag 모두 지원)
+            let req_etag_clean = req_etag.trim().trim_start_matches("W/");
+            let entry_etag_clean = entry_etag.trim().trim_start_matches("W/");
+            if req_etag_clean == entry_etag_clean || req_etag == "*" {
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = StatusCode::NOT_MODIFIED;
+                if let Some(ct) = &entry.content_type {
+                    if let Ok(hv) = ct.parse() {
+                        resp.headers_mut().insert(header::CONTENT_TYPE, hv);
+                    }
+                }
+                if let Ok(hv) = entry_etag.parse() {
+                    resp.headers_mut().insert(header::ETAG, hv);
+                }
+                resp.headers_mut().insert(
+                    "X-Cache",
+                    header::HeaderValue::from_static(if entry.is_fresh { "HIT" } else { "STALE" }),
+                );
+                let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
+                info!(
+                    method = %method,
+                    path = %path,
+                    status = 304,
+                    cache = cache_status,
+                    duration_ms = %start_time.elapsed().as_millis(),
+                    "Request completed (304 Not Modified)"
+                );
+                // stale 이면 백그라운드 재검증
+                if !entry.is_fresh {
+                    let bg_shared = shared.clone();
+                    let bg_key = final_cache_key.clone();
+                    let bg_base_key = base_cache_key.clone();
+                    tokio::spawn(async move {
+                        let _ = background_refresh(bg_key, bg_base_key, bg_shared).await;
+                    });
+                }
+                return Ok(resp);
+            }
+        }
+
         let mut extra_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
         extra_headers.push((
             header::ACCEPT_RANGES,
             header::HeaderValue::from_static("bytes"),
         ));
-        if let Some((start, end_opt)) = range_request {
-            if total_len == 0 {
-                status = StatusCode::RANGE_NOT_SATISFIABLE;
-                if let Ok(hv) = header::HeaderValue::from_str(&format!("bytes */{}", total_len)) {
-                    extra_headers.push((header::CONTENT_RANGE, hv));
-                }
-                body_bytes = Bytes::new();
-            } else {
-                let (range_start, range_end) = if start == u64::MAX {
-                    // suffix
-                    let suffix = end_opt.unwrap_or(0).min(total_len);
-                    (total_len.saturating_sub(suffix), total_len - 1)
-                } else {
-                    let end = end_opt
-                        .unwrap_or_else(|| total_len.saturating_sub(1))
-                        .min(total_len.saturating_sub(1));
-                    (start.min(total_len), end)
-                };
-                if range_start <= range_end && range_start < total_len {
-                    let start_usize = range_start as usize;
-                    let end_usize = (range_end as usize).min(entry.bytes.len() - 1);
-                    body_bytes = entry.bytes.slice(start_usize..=end_usize);
-                    status = StatusCode::PARTIAL_CONTENT;
-                    if let Ok(hv) = header::HeaderValue::from_str(&format!(
-                        "bytes {}-{}/{}",
-                        range_start, range_end, total_len
-                    )) {
-                        extra_headers.push((header::CONTENT_RANGE, hv));
-                    }
-                } else {
-                    status = StatusCode::RANGE_NOT_SATISFIABLE;
-                    if let Ok(hv) = header::HeaderValue::from_str(&format!("bytes */{}", total_len))
-                    {
-                        extra_headers.push((header::CONTENT_RANGE, hv));
-                    }
-                    body_bytes = Bytes::new();
-                }
+        
+        // Range 적용 (공통 함수 사용)
+        let range_result = apply_range(&entry.bytes, range_request);
+        if let Some(cr) = &range_result.content_range {
+            if let Ok(hv) = header::HeaderValue::from_str(cr) {
+                extra_headers.push((header::CONTENT_RANGE, hv));
             }
-        } else {
-            body_bytes = entry.bytes;
         }
-        let mut resp = Response::new(Body::from(body_bytes));
-        *resp.status_mut() = status;
+
+        // HEAD 요청이면 body 비우기
+        let response_body = if is_head {
+            Body::empty()
+        } else {
+            Body::from(range_result.body.clone())
+        };
+        let mut resp = Response::new(response_body);
+        *resp.status_mut() = range_result.status;
+        // Content-Length는 HEAD에서도 실제 크기를 반환
+        if is_head {
+            if let Ok(hv) = header::HeaderValue::from_str(&range_result.body.len().to_string()) {
+                resp.headers_mut().insert(header::CONTENT_LENGTH, hv);
+            }
+        }
         if let Some(ct) = entry.content_type {
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 ct.parse()
                     .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
             );
+        }
+        // ETag 헤더 추가
+        if let Some(etag) = &entry.etag {
+            if let Ok(hv) = etag.parse() {
+                resp.headers_mut().insert(header::ETAG, hv);
+            }
         }
         resp.headers_mut().insert(
             "X-Cache",
@@ -234,6 +323,15 @@ async fn handle(
                 let _ = background_refresh(bg_key, bg_base_key, bg_shared).await;
             });
         }
+        let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
+        info!(
+            method = %method,
+            path = %path,
+            status = %resp.status().as_u16(),
+            cache = cache_status,
+            duration_ms = %start_time.elapsed().as_millis(),
+            "Request completed"
+        );
         return Ok(resp);
     }
 
@@ -252,59 +350,45 @@ async fn handle(
             let status = up_resp.status();
             let headers = up_resp.headers().clone();
 
-            // Range 요청 (캐시 미스 시): 전체 업스트림 바디 수신 후 슬라이싱 (단순 구현)
+            // Range 요청 (캐시 미스 시): 전체 업스트림 바디 수신 후 슬라이싱 (공통 함수 사용)
             if range_request.is_some() {
                 let body_bytes = hyper::body::to_bytes(up_resp.into_body())
                     .await
                     .unwrap_or_else(|_| Bytes::new());
-                let mut resp_body = body_bytes.clone();
-                let mut resp_status = status;
                 let mut extra_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
                 extra_headers.push((
                     header::ACCEPT_RANGES,
                     header::HeaderValue::from_static("bytes"),
                 ));
-                if let Some((start, end_opt)) = range_request {
-                    let total_len = body_bytes.len() as u64;
-                    if body_bytes.len() > 0 {
-                        let (range_start, range_end) = if start == u64::MAX {
-                            let suffix = end_opt.unwrap_or(0).min(total_len);
-                            (total_len - suffix, total_len - 1)
-                        } else {
-                            let end = end_opt
-                                .unwrap_or_else(|| total_len.saturating_sub(1))
-                                .min(total_len.saturating_sub(1));
-                            (start.min(total_len), end)
-                        };
-                        if range_start <= range_end && range_start < total_len {
-                            let start_usize = range_start as usize;
-                            let end_usize = (range_end as usize).min(body_bytes.len() - 1);
-                            resp_body = body_bytes.slice(start_usize..=end_usize);
-                            resp_status = StatusCode::PARTIAL_CONTENT;
-                            if let Ok(hv) = header::HeaderValue::from_str(&format!(
-                                "bytes {}-{}/{}",
-                                range_start, range_end, total_len
-                            )) {
-                                extra_headers.push((header::CONTENT_RANGE, hv));
-                            }
-                        } else {
-                            resp_status = StatusCode::RANGE_NOT_SATISFIABLE;
-                            resp_body = Bytes::new();
-                            if let Ok(hv) =
-                                header::HeaderValue::from_str(&format!("bytes */{}", total_len))
-                            {
-                                extra_headers.push((header::CONTENT_RANGE, hv));
-                            }
-                        }
+                
+                // Range 적용 (공통 함수 사용)
+                let range_result = apply_range(&body_bytes, range_request);
+                if let Some(cr) = &range_result.content_range {
+                    if let Ok(hv) = header::HeaderValue::from_str(cr) {
+                        extra_headers.push((header::CONTENT_RANGE, hv));
                     }
                 }
-                let mut resp = Response::new(Body::from(resp_body));
-                *resp.status_mut() = resp_status;
+
+                let mut resp = Response::new(if is_head { Body::empty() } else { Body::from(range_result.body.clone()) });
+                *resp.status_mut() = range_result.status;
+                if is_head {
+                    if let Ok(hv) = header::HeaderValue::from_str(&range_result.body.len().to_string()) {
+                        resp.headers_mut().insert(header::CONTENT_LENGTH, hv);
+                    }
+                }
                 resp.headers_mut()
                     .insert("X-Cache", header::HeaderValue::from_static("MISS"));
                 for (k, v) in extra_headers {
                     resp.headers_mut().insert(k, v);
                 }
+                info!(
+                    method = %method,
+                    path = %path,
+                    status = %resp.status().as_u16(),
+                    cache = "MISS",
+                    duration_ms = %start_time.elapsed().as_millis(),
+                    "Request completed"
+                );
                 return Ok(resp);
             }
 
@@ -348,7 +432,44 @@ async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
+            // ETag 추출 (캐시 저장 및 조건부 요청용)
+            let upstream_etag = headers
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             let mut up_body = up_resp.into_body();
+            // HEAD 요청이면 body 스트리밍 필요 없음
+            if is_head {
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = status;
+                resp.headers_mut()
+                    .insert("X-Cache", header::HeaderValue::from_static("MISS"));
+                resp.headers_mut().insert(
+                    header::ACCEPT_RANGES,
+                    header::HeaderValue::from_static("bytes"),
+                );
+                if let Some(ct_val) = headers.get(header::CONTENT_TYPE) {
+                    resp.headers_mut()
+                        .insert(header::CONTENT_TYPE, ct_val.clone());
+                }
+                if let Some(cl_val) = headers.get(header::CONTENT_LENGTH) {
+                    resp.headers_mut()
+                        .insert(header::CONTENT_LENGTH, cl_val.clone());
+                }
+                if let Some(etag_val) = headers.get(header::ETAG) {
+                    resp.headers_mut().insert(header::ETAG, etag_val.clone());
+                }
+                info!(
+                    method = %method,
+                    path = %path,
+                    status = %resp.status().as_u16(),
+                    cache = "MISS",
+                    duration_ms = %start_time.elapsed().as_millis(),
+                    "Request completed"
+                );
+                return Ok(resp);
+            }
             let (mut tx, body) = Body::channel();
             let mut resp = Response::new(body);
             *resp.status_mut() = status;
@@ -377,6 +498,7 @@ async fn handle(
             // 스트리밍 및 캐시 저장 태스크
             if decision.cacheable && status.is_success() {
                 let cache_cloned = cache.clone();
+                let etag_for_cache = upstream_etag.clone();
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     while let Some(chunk_res) = up_body.data().await {
@@ -401,6 +523,7 @@ async fn handle(
                                 ct,
                                 decision.ttl,
                                 decision.stale_while_revalidate,
+                                etag_for_cache,
                             )
                             .await;
                     }
@@ -421,7 +544,20 @@ async fn handle(
             Ok(resp)
         }
         Err(err) => {
-            warn!(error=?err, "Upstream fetch failed");
+            warn!(
+                error = ?err,
+                method = %method,
+                path = %path,
+                "Upstream fetch failed"
+            );
+            info!(
+                method = %method,
+                path = %path,
+                status = 502,
+                cache = "ERROR",
+                duration_ms = %start_time.elapsed().as_millis(),
+                "Request completed"
+            );
             Ok(simple(StatusCode::BAD_GATEWAY, "Upstream error"))
         }
     }
@@ -459,6 +595,10 @@ async fn background_refresh(
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let etag = headers
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
                 let decision = derive_ttl(&headers, std::time::SystemTime::now());
                 if decision.cacheable {
                     // 기존 cache_key 덮어쓰기 (variant 유지)
@@ -469,6 +609,7 @@ async fn background_refresh(
                             ct,
                             decision.ttl,
                             decision.stale_while_revalidate,
+                            etag,
                         )
                         .await;
                 }
@@ -482,4 +623,62 @@ fn simple(code: StatusCode, msg: &str) -> Response<Body> {
     let mut r = Response::new(Body::from(msg.to_string()));
     *r.status_mut() = code;
     r
+}
+
+/// Range 요청 적용 결과
+struct RangeResult {
+    body: Bytes,
+    status: StatusCode,
+    content_range: Option<String>,
+}
+
+/// Range 요청을 데이터에 적용하는 공통 함수
+fn apply_range(
+    data: &Bytes,
+    range: Option<(u64, Option<u64>)>,
+) -> RangeResult {
+    let total_len = data.len() as u64;
+    
+    let Some((start, end_opt)) = range else {
+        return RangeResult {
+            body: data.clone(),
+            status: StatusCode::OK,
+            content_range: None,
+        };
+    };
+
+    if total_len == 0 {
+        return RangeResult {
+            body: Bytes::new(),
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            content_range: Some(format!("bytes */{}", total_len)),
+        };
+    }
+
+    let (range_start, range_end) = if start == u64::MAX {
+        // suffix range: -500 means last 500 bytes
+        let suffix = end_opt.unwrap_or(0).min(total_len);
+        (total_len.saturating_sub(suffix), total_len - 1)
+    } else {
+        let end = end_opt
+            .unwrap_or_else(|| total_len.saturating_sub(1))
+            .min(total_len.saturating_sub(1));
+        (start.min(total_len), end)
+    };
+
+    if range_start <= range_end && range_start < total_len {
+        let start_usize = range_start as usize;
+        let end_usize = (range_end as usize).min(data.len() - 1);
+        RangeResult {
+            body: data.slice(start_usize..=end_usize),
+            status: StatusCode::PARTIAL_CONTENT,
+            content_range: Some(format!("bytes {}-{}/{}", range_start, range_end, total_len)),
+        }
+    } else {
+        RangeResult {
+            body: Bytes::new(),
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            content_range: Some(format!("bytes */{}", total_len)),
+        }
+    }
 }

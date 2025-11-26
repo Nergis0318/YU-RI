@@ -22,6 +22,7 @@ struct Meta {
     pub content_type: Option<String>,
     swr_expires_at: Option<u64>, // stale-while-revalidate 만료 시각 (expires_at 이후 추가 허용 구간)
     last_access_at: u64,         // LRU 용 (get 시 갱신)
+    pub etag: Option<String>,    // ETag 헤더 (조건부 요청 지원용)
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub struct CacheEntry {
     pub bytes: Bytes,
     pub content_type: Option<String>,
     pub is_fresh: bool, // true: TTL 내, false: stale (swr 허용)
+    pub etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -135,7 +137,12 @@ impl DiskCache {
         let path = self.key_path(key);
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
-        if !data_path.exists() || !meta_path.exists() {
+        // 비동기 파일 존재 체크 (tokio::fs::metadata 사용)
+        let (data_exists, meta_exists) = tokio::join!(
+            tfs::metadata(&data_path),
+            tfs::metadata(&meta_path)
+        );
+        if data_exists.is_err() || meta_exists.is_err() {
             return Ok(None);
         }
         let meta_bytes = tfs::read(&meta_path).await.ok();
@@ -156,6 +163,7 @@ impl DiskCache {
                                 bytes: Bytes::from(db),
                                 content_type: meta.content_type,
                                 is_fresh: false,
+                                etag: meta.etag,
                             }));
                         }
                     }
@@ -172,6 +180,7 @@ impl DiskCache {
                     bytes: Bytes::from(db),
                     content_type: meta.content_type,
                     is_fresh: true,
+                    etag: meta.etag,
                 }));
             }
         }
@@ -185,6 +194,7 @@ impl DiskCache {
         content_type: Option<String>,
         ttl: Option<Duration>,
         swr: Option<Duration>,
+        etag: Option<String>,
     ) -> Result<()> {
         let _g = self.inner.lock().await; // ensure size ops consistent
         let path = self.key_path(key);
@@ -203,6 +213,7 @@ impl DiskCache {
             content_type,
             swr_expires_at: swr.map(|d| now + ttl_dur.as_secs() + d.as_secs()),
             last_access_at: now,
+            etag,
         };
         let meta_json = serde_json::to_vec(&meta)?;
         Self::write_file(&data_path, bytes).await?;
