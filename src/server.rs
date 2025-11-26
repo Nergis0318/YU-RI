@@ -9,7 +9,7 @@ use hyper::{
     body::HttpBody as _,
     service::{make_service_fn, service_fn},
 };
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn, debug};
@@ -24,7 +24,12 @@ pub async fn run(config: Config) -> Result<()> {
     .await?;
     let addr = config.listen_addr.parse().unwrap();
     // 재사용 가능한 HTTPS 클라이언트 (connection pooling)
-    let https = HttpsConnector::new();
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
     let client: Client<_, hyper::Body> = Client::builder().build(https);
     let shared = Arc::new((config, cache, client));
 
@@ -116,7 +121,7 @@ async fn handle(
     shared: Arc<(
         Config,
         DiskCache,
-        Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+        Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
     )>,
 ) -> Result<Response<Body>, hyper::Error> {
     let start_time = Instant::now();
@@ -241,7 +246,7 @@ async fn handle(
                     resp.headers_mut().insert(header::ETAG, hv);
                 }
                 resp.headers_mut().insert(
-                    "X-Cache",
+                    "X-YU-RI-Cache",
                     header::HeaderValue::from_static(if entry.is_fresh { "HIT" } else { "STALE" }),
                 );
                 let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
@@ -308,7 +313,7 @@ async fn handle(
             }
         }
         resp.headers_mut().insert(
-            "X-Cache",
+            "X-YU-RI-Cache",
             header::HeaderValue::from_static(if entry.is_fresh { "HIT" } else { "STALE" }),
         );
         for (k, v) in extra_headers {
@@ -338,7 +343,7 @@ async fn handle(
     // Fetch from upstream (support http & https)
     // 재사용 client (connection pool)
     // Upstream 요청 시 User-Agent 고정 설정
-    let ua_header = http::HeaderValue::from_static("RFMP/1.0");
+    let ua_header = http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)");
     let upstream_req = Request::builder()
         .method(http::Method::GET)
         .uri(upstream_url.as_str())
@@ -377,7 +382,7 @@ async fn handle(
                     }
                 }
                 resp.headers_mut()
-                    .insert("X-Cache", header::HeaderValue::from_static("MISS"));
+                    .insert("X-YU-RI-Cache", header::HeaderValue::from_static("MISS"));
                 for (k, v) in extra_headers {
                     resp.headers_mut().insert(k, v);
                 }
@@ -444,7 +449,7 @@ async fn handle(
                 let mut resp = Response::new(Body::empty());
                 *resp.status_mut() = status;
                 resp.headers_mut()
-                    .insert("X-Cache", header::HeaderValue::from_static("MISS"));
+                    .insert("X-YU-RI-Cache", header::HeaderValue::from_static("MISS"));
                 resp.headers_mut().insert(
                     header::ACCEPT_RANGES,
                     header::HeaderValue::from_static("bytes"),
@@ -474,7 +479,7 @@ async fn handle(
             let mut resp = Response::new(body);
             *resp.status_mut() = status;
             resp.headers_mut()
-                .insert("X-Cache", header::HeaderValue::from_static("MISS"));
+                .insert("X-YU-RI-Cache", header::HeaderValue::from_static("MISS"));
             resp.headers_mut().insert(
                 header::ACCEPT_RANGES,
                 header::HeaderValue::from_static("bytes"),
@@ -570,7 +575,7 @@ async fn background_refresh(
     shared: Arc<(
         Config,
         DiskCache,
-        Client<HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+        Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
     )>,
 ) -> Result<(), anyhow::Error> {
     let (_config, cache, client) = (&shared.0, &shared.1, &shared.2);
@@ -582,7 +587,7 @@ async fn background_refresh(
             .uri(upstream_url.as_str())
             .header(
                 header::USER_AGENT,
-                http::HeaderValue::from_static("RFMP/1.0"),
+                http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)"),
             )
             .body(Body::empty())
             .expect("build upstream request");

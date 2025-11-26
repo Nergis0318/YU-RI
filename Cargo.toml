@@ -1,13 +1,13 @@
 [package]
 name = "yu-ri"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
 bytes = "1"
 hyper = { version = "0.14", features = ["full"] }
-hyper-tls = "0.5"
+hyper-rustls = { version = "0.25", features = ["http1", "http2", "webpki-tokio"] }
 http = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
