@@ -138,10 +138,8 @@ impl DiskCache {
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
         // 비동기 파일 존재 체크 (tokio::fs::metadata 사용)
-        let (data_exists, meta_exists) = tokio::join!(
-            tfs::metadata(&data_path),
-            tfs::metadata(&meta_path)
-        );
+        let (data_exists, meta_exists) =
+            tokio::join!(tfs::metadata(&data_path), tfs::metadata(&meta_path));
         if data_exists.is_err() || meta_exists.is_err() {
             return Ok(None);
         }

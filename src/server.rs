@@ -12,7 +12,7 @@ use hyper::{
 use hyper_rustls::HttpsConnectorBuilder;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 pub async fn run(config: Config) -> Result<()> {
     let cache = DiskCache::new(
@@ -145,7 +145,10 @@ async fn handle(
     let is_head = method == http::Method::HEAD;
     if method != http::Method::GET && !is_head {
         warn!(method = %method, path = %path, "Method not allowed");
-        return Ok(simple(StatusCode::METHOD_NOT_ALLOWED, "Only GET/HEAD supported"));
+        return Ok(simple(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Only GET/HEAD supported",
+        ));
     }
 
     // Path traversal protection
@@ -276,7 +279,7 @@ async fn handle(
             header::ACCEPT_RANGES,
             header::HeaderValue::from_static("bytes"),
         ));
-        
+
         // Range 적용 (공통 함수 사용)
         let range_result = apply_range(&entry.bytes, range_request);
         if let Some(cr) = &range_result.content_range {
@@ -343,7 +346,8 @@ async fn handle(
     // Fetch from upstream (support http & https)
     // 재사용 client (connection pool)
     // Upstream 요청 시 User-Agent 고정 설정
-    let ua_header = http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)");
+    let ua_header =
+        http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)");
     let upstream_req = Request::builder()
         .method(http::Method::GET)
         .uri(upstream_url.as_str())
@@ -365,7 +369,7 @@ async fn handle(
                     header::ACCEPT_RANGES,
                     header::HeaderValue::from_static("bytes"),
                 ));
-                
+
                 // Range 적용 (공통 함수 사용)
                 let range_result = apply_range(&body_bytes, range_request);
                 if let Some(cr) = &range_result.content_range {
@@ -374,10 +378,16 @@ async fn handle(
                     }
                 }
 
-                let mut resp = Response::new(if is_head { Body::empty() } else { Body::from(range_result.body.clone()) });
+                let mut resp = Response::new(if is_head {
+                    Body::empty()
+                } else {
+                    Body::from(range_result.body.clone())
+                });
                 *resp.status_mut() = range_result.status;
                 if is_head {
-                    if let Ok(hv) = header::HeaderValue::from_str(&range_result.body.len().to_string()) {
+                    if let Ok(hv) =
+                        header::HeaderValue::from_str(&range_result.body.len().to_string())
+                    {
                         resp.headers_mut().insert(header::CONTENT_LENGTH, hv);
                     }
                 }
@@ -638,12 +648,9 @@ struct RangeResult {
 }
 
 /// Range 요청을 데이터에 적용하는 공통 함수
-fn apply_range(
-    data: &Bytes,
-    range: Option<(u64, Option<u64>)>,
-) -> RangeResult {
+fn apply_range(data: &Bytes, range: Option<(u64, Option<u64>)>) -> RangeResult {
     let total_len = data.len() as u64;
-    
+
     let Some((start, end_opt)) = range else {
         return RangeResult {
             body: data.clone(),
