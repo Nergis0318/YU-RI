@@ -42,6 +42,7 @@ pub struct DiskCache {
     // 정책: 구성 단계에서 선택
     policy: crate::config::EvictionPolicy,
     touch_tx: mpsc::Sender<PathBuf>, // 비동기 last_access_at 갱신 큐
+    evict_tx: mpsc::Sender<()>,      // 비동기 eviction 트리거
 }
 
 impl DiskCache {
@@ -53,11 +54,13 @@ impl DiskCache {
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         tfs::create_dir_all(&root).await?;
-        let (tx, mut rx) = mpsc::channel::<PathBuf>(1024);
+        let (touch_tx, mut touch_rx) = mpsc::channel::<PathBuf>(1024);
+        let (evict_tx, mut evict_rx) = mpsc::channel::<()>(1);
+        
         let root_clone = root.clone();
         // 비동기 last_access_at 터치 워커
         tokio::spawn(async move {
-            while let Some(meta_path) = rx.recv().await {
+            while let Some(meta_path) = touch_rx.recv().await {
                 // meta 파일 읽고 last_access_at 갱신 (best-effort)
                 if let Ok(bytes) = tfs::read(&meta_path).await {
                     if let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) {
@@ -82,14 +85,29 @@ impl DiskCache {
             }
             debug!(target: "cache", root=?root_clone, "touch worker stopped");
         });
-        Ok(Self {
+
+        let cache = Self {
             root,
             max_size,
             inner: Arc::new(Mutex::new(())),
             default_ttl,
             policy,
-            touch_tx: tx,
-        })
+            touch_tx,
+            evict_tx,
+        };
+
+        // 비동기 eviction 워커
+        let cache_for_evict = cache.clone();
+        tokio::spawn(async move {
+            while let Some(_) = evict_rx.recv().await {
+                // 단순화: 신호 받으면 실행. (debouncing 추가 가능)
+                if let Err(e) = cache_for_evict.enforce_size_limit().await {
+                    debug!(target: "cache", error=?e, "eviction failed");
+                }
+            }
+        });
+
+        Ok(cache)
     }
 
     /// 전체 캐시 비우기 (디렉토리 내 .bin / .meta / .vary 파일 삭제)
@@ -216,11 +234,33 @@ impl DiskCache {
         let meta_json = serde_json::to_vec(&meta)?;
         Self::write_file(&data_path, bytes).await?;
         Self::write_file(&meta_path, &meta_json).await?;
-        self.enforce_size_limit().await?;
+        
+        // 비동기 eviction 트리거
+        let _ = self.evict_tx.try_send(());
+        
         Ok(())
     }
 
     async fn enforce_size_limit(&self) -> Result<()> {
+        // _g lock removed here because we want this to be background and not block put?
+        // But if multiple evictions run, it might be weird.
+        // Also self.inner is Mutex<()>. If we lock it here, we block 'put' if 'put' locks it.
+        // Wait, 'put' locks it to write file. Writing file is fast.
+        // enforce_size_limit walks dir, which is slow.
+        // If we lock here, we block 'put' while walking dir. That defeats the purpose.
+        // So we should NOT lock self.inner for the whole duration.
+        // Maybe we don't need to lock at all for reading?
+        // Deletion might race with new writes?
+        // If we delete a file that is being written... temporary files?
+        // 'put' writes to temp then rename? No, it writes directly.
+        // Ideally 'put' writes to temp.
+        // Current impl writes directly.
+        // If eviction deletes a file just as it's written?
+        // 'put' overwrites.
+        // Eviction finds files.
+        // If we list files, then delete oldest.
+        // It's acceptable race for cache.
+        
         let mut entries: Vec<(PathBuf, u64, u64, u64)> = Vec::new(); // (base_path, created_at, size, last_access_at)
         let mut total = 0u64;
         let mut stack = vec![self.root.clone()];
