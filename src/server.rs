@@ -281,6 +281,9 @@ async fn handle(
                     "X-YU-RI-Cache",
                     header::HeaderValue::from_static(if entry.is_fresh { "HIT" } else { "STALE" }),
                 );
+                if let Ok(hv) = header::HeaderValue::from_str(&entry.created_at.to_string()) {
+                    resp.headers_mut().insert("X-YU-RI-Time", hv);
+                }
                 let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
                 info!(
                     method = %method,
@@ -344,6 +347,9 @@ async fn handle(
             "X-YU-RI-Cache",
             header::HeaderValue::from_static(if entry.is_fresh { "HIT" } else { "STALE" }),
         );
+        if let Ok(hv) = header::HeaderValue::from_str(&entry.created_at.to_string()) {
+            resp.headers_mut().insert("X-YU-RI-Time", hv);
+        }
         for (k, v) in extra_headers {
             resp.headers_mut().insert(k, v);
         }

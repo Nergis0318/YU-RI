@@ -31,6 +31,7 @@ pub struct CacheEntry {
     pub content_type: Option<String>,
     pub is_fresh: bool, // true: TTL 내, false: stale (swr 허용)
     pub etag: Option<String>,
+    pub created_at: u64,
 }
 
 #[derive(Clone)]
@@ -180,6 +181,7 @@ impl DiskCache {
                                 content_type: meta.content_type,
                                 is_fresh: false,
                                 etag: meta.etag,
+                                created_at: meta.created_at,
                             }));
                         }
                     }
@@ -197,6 +199,7 @@ impl DiskCache {
                     content_type: meta.content_type,
                     is_fresh: true,
                     etag: meta.etag,
+                    created_at: meta.created_at,
                 }));
             }
         }
