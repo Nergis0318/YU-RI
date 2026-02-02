@@ -57,7 +57,7 @@ impl DiskCache {
         tfs::create_dir_all(&root).await?;
         let (touch_tx, mut touch_rx) = mpsc::channel::<PathBuf>(1024);
         let (evict_tx, mut evict_rx) = mpsc::channel::<()>(1);
-        
+
         let root_clone = root.clone();
         // 비동기 last_access_at 터치 워커
         tokio::spawn(async move {
@@ -237,10 +237,10 @@ impl DiskCache {
         let meta_json = serde_json::to_vec(&meta)?;
         Self::write_file(&data_path, bytes).await?;
         Self::write_file(&meta_path, &meta_json).await?;
-        
+
         // 비동기 eviction 트리거
         let _ = self.evict_tx.try_send(());
-        
+
         Ok(())
     }
 
@@ -263,7 +263,7 @@ impl DiskCache {
         // Eviction finds files.
         // If we list files, then delete oldest.
         // It's acceptable race for cache.
-        
+
         let mut entries: Vec<(PathBuf, u64, u64, u64)> = Vec::new(); // (base_path, created_at, size, last_access_at)
         let mut total = 0u64;
         let mut stack = vec![self.root.clone()];

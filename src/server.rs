@@ -46,10 +46,10 @@ pub async fn run(config: Config) -> Result<()> {
         .https_or_http()
         .enable_http1()
         .enable_http2();
-    
+
     let https = builder.build();
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
-    
+
     let shared = Arc::new((config, cache, client));
 
     // Cron Cache Clear Scheduler (Optional)
@@ -129,7 +129,7 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }
     }
-    
+
     info!("Server shutdown complete");
     Ok(())
 }
@@ -377,7 +377,7 @@ async fn handle(
     // MISS: Fetch from upstream
     let ua_header =
         http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)");
-    
+
     let upstream_req = Request::builder()
         .method(http::Method::GET)
         .uri(upstream_url.as_str())
@@ -393,7 +393,7 @@ async fn handle(
             if range_request.is_some() {
                 // Collect entire body to slice it
                 let body_bytes = up_resp.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-                
+
                 let mut extra_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
                 extra_headers.push((
                     header::ACCEPT_RANGES,
@@ -517,15 +517,15 @@ async fn handle(
             // But implementing Stream body for Hyper 1.0 requires `Body` trait impl or `Stream` wrapper.
             // We'll use a simple `StreamBody` wrapper using `tokio::sync::mpsc` if available, or just
             // `http_body_util::StreamBody` with a channel.
-            
+
             // However, Hyper 1.0 body is `Frame` based.
             // Let's use `http_body_util::combinators::BoxBody` which we alias as `BoxBody`.
             // We will spawn a task that reads upstream body, writes to cache buffer, and sends to a channel
             // that feeds the response body.
-            
+
             // We can use a channel to stream data to the response.
             let (tx, body_stream) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(32);
-            
+
             // Convert receiver to Body
             let stream_body = http_body_util::StreamBody::new(
                 tokio_stream::wrappers::ReceiverStream::new(body_stream)
@@ -584,7 +584,7 @@ async fn handle(
                         }
                     }
                 }
-                
+
                 // Drop tx to close stream
                 drop(tx);
 
@@ -631,7 +631,7 @@ async fn background_refresh(
 ) -> Result<(), anyhow::Error> {
     let (_config, cache, client) = (&shared.0, &shared.1, &shared.2);
     let upstream_url = base_cache_key;
-    
+
     let upstream_req = Request::builder()
         .method(http::Method::GET)
         .uri(upstream_url.as_str())
@@ -647,7 +647,7 @@ async fn background_refresh(
             let headers = up_resp.headers().clone();
             if let Ok(collected) = up_resp.collect().await {
                 let body_bytes = collected.to_bytes();
-                
+
                 let ct = headers
                     .get(header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
@@ -657,7 +657,7 @@ async fn background_refresh(
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
                 let decision = derive_ttl(&headers, std::time::SystemTime::now());
-                
+
                 if decision.cacheable {
                     let _ = cache
                         .put(
