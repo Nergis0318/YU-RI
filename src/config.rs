@@ -1,21 +1,78 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::path::Path;
 use std::time::Duration;
+
+/// Raw TOML structure matching config.toml layout
+#[derive(Debug, Deserialize)]
+struct TomlConfig {
+    settings: TomlSettings,
+    upstream: TomlUpstream,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlSettings {
+    host: Option<String>,
+    port: Option<u16>,
+    log: Option<String>,
+    cache: Option<TomlCache>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlCache {
+    dir: Option<String>,
+    size: Option<u64>,
+    ttl: Option<u64>,
+    policy: Option<String>,
+    interval: Option<TomlCacheInterval>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlCacheInterval {
+    enable: Option<bool>,
+    time: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlUpstream {
+    url: String,
+    sub: Option<Vec<TomlUpstreamSub>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlUpstreamSub {
+    url: String,
+    path: String,
+}
+
+// ── Public types ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct UpstreamSub {
+    /// Base URL for this sub-route (e.g. "https://example.com/asdadsad")
+    pub url: String,
+    /// Path prefix to match (e.g. "/path/to/subpath")
+    pub path: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: String,
+    pub log_level: String,
     pub upstream_base: String,
+    /// Sub-path upstream overrides, sorted longest-path-first for greedy matching
+    pub upstream_subs: Vec<UpstreamSub>,
     pub cache_dir: String,
     pub max_cache_size_bytes: u64,
     pub default_ttl: Duration,
     pub eviction_policy: EvictionPolicy,
-    pub cache_clear_cron: Option<String>, // "0" 또는 비설정이면 비활성화
-    pub cache_clear_interval: Option<Duration>, // CACHE_CLEAR_INTERVAL_SECS (초) 0 또는 미설정 => 비활성화
+    pub cache_clear_cron: Option<String>,
+    pub cache_clear_interval: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum EvictionPolicy {
-    /// First-In-First-Out (기존 created_at 기반)
+    /// First-In-First-Out (created_at 기반)
     Fifo,
     /// Least Recently Used (last_access_at 오래된 것 먼저)
     Lru,
@@ -26,59 +83,223 @@ pub enum EvictionPolicy {
 }
 
 impl EvictionPolicy {
-    pub fn from_env_var(s: &str) -> Self {
+    pub fn from_str_loose(s: &str) -> Self {
         match s.to_ascii_uppercase().as_str() {
             "FIFO" => Self::Fifo,
             "SIZE" => Self::Size,
-            "LRU_SIZE" => Self::LruSize,
+            "LRU_SIZE" | "LRUSIZE" | "LRU-SIZE" => Self::LruSize,
             _ => Self::Lru, // 기본 LRU
         }
     }
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self> {
-        let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-        let upstream_base = std::env::var("UPSTREAM_BASE").context("UPSTREAM_BASE is required")?;
-        let cache_dir = std::env::var("CACHE_DIR").unwrap_or_else(|_| "cache".into());
-        let max_cache_size_bytes: u64 = std::env::var("MAX_CACHE_SIZE_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5 * 1024 * 1024 * 1024); // 5GB default
-        let default_ttl_secs: u64 = std::env::var("DEFAULT_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
-        let eviction_policy = std::env::var("EVICTION_POLICY").unwrap_or_else(|_| "LRU".into());
-        let cache_clear_cron_raw = std::env::var("CACHE_CLEAR_CRON").ok();
-        let cache_clear_cron = cache_clear_cron_raw.and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() || trimmed == "0" {
-                None
+    /// Load configuration from `config.toml` located at `path`.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let raw: TomlConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        // ── settings ────────────────────────────────────────
+        let host = raw.settings.host.unwrap_or_else(|| "127.0.0.1".into());
+        let port = raw.settings.port.unwrap_or(8080);
+        let listen_addr = format!("{}:{}", host, port);
+        let log_level = raw.settings.log.unwrap_or_else(|| "info".into());
+
+        // ── cache ───────────────────────────────────────────
+        let (cache_dir, max_cache_size_bytes, default_ttl, eviction_policy, cache_clear_interval) =
+            if let Some(cache) = raw.settings.cache {
+                let dir = cache.dir.unwrap_or_else(|| "cache".into());
+                let size = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
+                let ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
+                let policy =
+                    EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
+
+                let interval = cache.interval.and_then(|iv| {
+                    if iv.enable.unwrap_or(false) {
+                        let secs = iv.time.unwrap_or(0);
+                        if secs > 0 {
+                            Some(Duration::from_secs(secs))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                (dir, size, ttl, policy, interval)
             } else {
-                Some(trimmed.to_string())
-            }
-        });
-        // 초 단위 주기적 전체 클리어 설정 (cron 보다 단순). 0 또는 음수/파싱 실패 => 비활성화
-        let cache_clear_interval = std::env::var("CACHE_CLEAR_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .and_then(|secs| {
-                if secs == 0 {
-                    None
+                (
+                    "cache".into(),
+                    5 * 1024 * 1024 * 1024,
+                    Duration::from_secs(300),
+                    EvictionPolicy::Lru,
+                    None,
+                )
+            };
+
+        // ── upstream ────────────────────────────────────────
+        let upstream_base = raw.upstream.url;
+
+        let mut upstream_subs: Vec<UpstreamSub> = raw
+            .upstream
+            .sub
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| {
+                // 경로는 항상 '/' 로 시작하도록 정규화, 끝의 '/' 는 제거
+                let path = if s.path.starts_with('/') {
+                    s.path.trim_end_matches('/').to_string()
                 } else {
-                    Some(Duration::from_secs(secs))
-                }
-            });
+                    format!("/{}", s.path.trim_end_matches('/'))
+                };
+                UpstreamSub { url: s.url, path }
+            })
+            .collect();
+
+        // 긴 path 부터 매칭하도록 내림차순 정렬 (greedy matching)
+        upstream_subs.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+
         Ok(Self {
             listen_addr,
+            log_level,
             upstream_base,
+            upstream_subs,
             cache_dir,
             max_cache_size_bytes,
-            default_ttl: Duration::from_secs(default_ttl_secs),
-            eviction_policy: EvictionPolicy::from_env_var(&eviction_policy),
-            cache_clear_cron,
+            default_ttl,
+            eviction_policy,
+            cache_clear_cron: None, // config.toml 에는 cron 필드 미포함; 필요시 확장
             cache_clear_interval,
         })
+    }
+
+    /// Resolve the upstream URL for a given request path.
+    ///
+    /// If a sub-path matches, the sub.path prefix is stripped from `req_path`
+    /// and the remainder is appended to `sub.url`.
+    /// Otherwise the default `upstream_base` is used with the full `req_path`.
+    ///
+    /// Example:
+    ///   sub.path = "/assets", sub.url = "https://cdn.example.com/static"
+    ///   req_path = "/assets/img/logo.png"
+    ///   → "https://cdn.example.com/static/img/logo.png"
+    pub fn resolve_upstream(&self, req_path_and_query: &str) -> String {
+        // req_path_and_query looks like "/some/path?query=1"
+        // We only match against the path portion for sub routing.
+        let path_only = req_path_and_query
+            .split('?')
+            .next()
+            .unwrap_or(req_path_and_query);
+
+        for sub in &self.upstream_subs {
+            if path_only == sub.path || path_only.starts_with(&format!("{}/", sub.path)) {
+                let remainder = &req_path_and_query[sub.path.len()..];
+                return format!(
+                    "{}{}{}",
+                    sub.url.trim_end_matches('/'),
+                    if remainder.is_empty()
+                        || remainder.starts_with('/')
+                        || remainder.starts_with('?')
+                    {
+                        ""
+                    } else {
+                        "/"
+                    },
+                    remainder
+                );
+            }
+        }
+
+        // Default upstream
+        format!(
+            "{}/{}",
+            self.upstream_base.trim_end_matches('/'),
+            req_path_and_query.trim_start_matches('/')
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config() -> Config {
+        Config {
+            listen_addr: "127.0.0.1:8080".into(),
+            log_level: "info".into(),
+            upstream_base: "https://example.kr".into(),
+            upstream_subs: vec![
+                UpstreamSub {
+                    url: "https://cdn.example.com/static".into(),
+                    path: "/assets/img".into(),
+                },
+                UpstreamSub {
+                    url: "https://cdn.example.com/all".into(),
+                    path: "/assets".into(),
+                },
+                UpstreamSub {
+                    url: "https://api.example.com".into(),
+                    path: "/api".into(),
+                },
+            ],
+            cache_dir: "cache".into(),
+            max_cache_size_bytes: 1_000_000,
+            default_ttl: Duration::from_secs(300),
+            eviction_policy: EvictionPolicy::Lru,
+            cache_clear_cron: None,
+            cache_clear_interval: None,
+        }
+    }
+
+    #[test]
+    fn test_default_upstream() {
+        let cfg = make_config();
+        assert_eq!(
+            cfg.resolve_upstream("/some/file.txt"),
+            "https://example.kr/some/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_sub_upstream() {
+        let cfg = make_config();
+        assert_eq!(
+            cfg.resolve_upstream("/api/v1/users"),
+            "https://api.example.com/v1/users"
+        );
+    }
+
+    #[test]
+    fn test_sub_upstream_exact_path() {
+        let cfg = make_config();
+        assert_eq!(cfg.resolve_upstream("/api"), "https://api.example.com");
+    }
+
+    #[test]
+    fn test_sub_upstream_with_query() {
+        let cfg = make_config();
+        assert_eq!(
+            cfg.resolve_upstream("/api/v1/users?page=1"),
+            "https://api.example.com/v1/users?page=1"
+        );
+    }
+
+    #[test]
+    fn test_longest_prefix_match() {
+        let cfg = make_config();
+        // /assets/img should match the longer prefix "/assets/img" not "/assets"
+        assert_eq!(
+            cfg.resolve_upstream("/assets/img/logo.png"),
+            "https://cdn.example.com/static/logo.png"
+        );
+        // /assets/css should match "/assets"
+        assert_eq!(
+            cfg.resolve_upstream("/assets/css/style.css"),
+            "https://cdn.example.com/all/css/style.css"
+        );
     }
 }

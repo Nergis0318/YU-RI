@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::http_cache::derive_ttl;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use http::{StatusCode, header, Request, Response};
+use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -195,14 +195,12 @@ async fn handle(
         return Ok(simple(StatusCode::BAD_REQUEST, "Invalid path"));
     }
 
-    let upstream_url = format!(
-        "{}/{}",
-        config.upstream_base.trim_end_matches('/'),
-        req.uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("")
-    );
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("");
+    let upstream_url = config.resolve_upstream(path_and_query);
     let base_cache_key = upstream_url.clone();
 
     // Range request parsing
@@ -392,7 +390,11 @@ async fn handle(
 
             if range_request.is_some() {
                 // Collect entire body to slice it
-                let body_bytes = up_resp.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+                let body_bytes = up_resp
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
 
                 let mut extra_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
                 extra_headers.push((
@@ -524,12 +526,14 @@ async fn handle(
             // that feeds the response body.
 
             // We can use a channel to stream data to the response.
-            let (tx, body_stream) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(32);
+            let (tx, body_stream) =
+                tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(32);
 
             // Convert receiver to Body
             let stream_body = http_body_util::StreamBody::new(
-                tokio_stream::wrappers::ReceiverStream::new(body_stream)
-            ).boxed();
+                tokio_stream::wrappers::ReceiverStream::new(body_stream),
+            )
+            .boxed();
 
             let mut resp = Response::new(stream_body);
             *resp.status_mut() = status;
