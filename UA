@@ -1,1 +1,1 @@
-YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)
+YU-RI/1.0.1 (https://github.com/DevNergis/YU-RI)

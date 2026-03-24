@@ -374,7 +374,7 @@ async fn handle(
 
     // MISS: Fetch from upstream
     let ua_header =
-        http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)");
+        http::HeaderValue::from_static("YU-RI/1.0.1 (https://github.com/DevNergis/YU-RI)");
 
     let upstream_req = Request::builder()
         .method(http::Method::GET)
@@ -641,7 +641,7 @@ async fn background_refresh(
         .uri(upstream_url.as_str())
         .header(
             header::USER_AGENT,
-            http::HeaderValue::from_static("YU-RI/1.0.0 (https://github.com/DevNergis/YU-RI)"),
+            http::HeaderValue::from_static("YU-RI/1.0.1 (https://github.com/DevNergis/YU-RI)"),
         )
         .body(Full::<Bytes>::new(Bytes::new()))
         .expect("build upstream request");
