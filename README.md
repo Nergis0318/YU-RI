@@ -13,8 +13,8 @@
 
 ```txt
 1. Request to YU-RI
-2. Cache Check ----> HIT = 4. Response
-                └--> MISS or TTL Expired = 3. Upstream ---> 4. Response
+2. Cache Check ----> HIT = 3. Response
+                └--> MISS or TTL Expired = 3. Upstream ---> 4. Response ---> 5. Save to cache
 ```
 
 **YU-RI**는 리눅스 미러용 고급 캐시기능이 있는 고성능 프록시 서버 입니다.
