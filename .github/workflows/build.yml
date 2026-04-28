@@ -41,6 +41,15 @@ jobs:
           sudo apt update -y
           sudo apt install -y musl-tools
 
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 

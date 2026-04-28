@@ -25,6 +25,8 @@ struct TomlCache {
     ttl: Option<u64>,
     policy: Option<String>,
     interval: Option<TomlCacheInterval>,
+    cron: Option<String>,
+    body_limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +70,7 @@ pub struct Config {
     pub eviction_policy: EvictionPolicy,
     pub cache_clear_cron: Option<String>,
     pub cache_clear_interval: Option<Duration>,
+    pub max_body_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,37 +112,49 @@ impl Config {
         let log_level = raw.settings.log.unwrap_or_else(|| "info".into());
 
         // ── cache ───────────────────────────────────────────
-        let (cache_dir, max_cache_size_bytes, default_ttl, eviction_policy, cache_clear_interval) =
-            if let Some(cache) = raw.settings.cache {
-                let dir = cache.dir.unwrap_or_else(|| "cache".into());
-                let size = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
-                let ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
-                let policy =
-                    EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
+        let (
+            cache_dir,
+            max_cache_size_bytes,
+            default_ttl,
+            eviction_policy,
+            cache_clear_interval,
+            cache_clear_cron,
+            max_body_bytes,
+        ) = if let Some(cache) = raw.settings.cache {
+            let dir = cache.dir.unwrap_or_else(|| "cache".into());
+            let size = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
+            let ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
+            let policy =
+                EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
 
-                let interval = cache.interval.and_then(|iv| {
-                    if iv.enable.unwrap_or(false) {
-                        let secs = iv.time.unwrap_or(0);
-                        if secs > 0 {
-                            Some(Duration::from_secs(secs))
-                        } else {
-                            None
-                        }
+            let interval = cache.interval.and_then(|iv| {
+                if iv.enable.unwrap_or(false) {
+                    let secs = iv.time.unwrap_or(0);
+                    if secs > 0 {
+                        Some(Duration::from_secs(secs))
                     } else {
                         None
                     }
-                });
+                } else {
+                    None
+                }
+            });
 
-                (dir, size, ttl, policy, interval)
-            } else {
-                (
-                    "cache".into(),
-                    5 * 1024 * 1024 * 1024,
-                    Duration::from_secs(300),
-                    EvictionPolicy::Lru,
-                    None,
-                )
-            };
+            let cron = cache.cron;
+            let body_limit = cache.body_limit;
+
+            (dir, size, ttl, policy, interval, cron, body_limit)
+        } else {
+            (
+                "cache".into(),
+                5 * 1024 * 1024 * 1024,
+                Duration::from_secs(300),
+                EvictionPolicy::Lru,
+                None,
+                None,
+                None,
+            )
+        };
 
         // ── upstream ────────────────────────────────────────
         let upstream_base = raw.upstream.url;
@@ -161,7 +176,7 @@ impl Config {
             .collect();
 
         // 긴 path 부터 매칭하도록 내림차순 정렬 (greedy matching)
-        upstream_subs.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        upstream_subs.sort_by_key(|b| std::cmp::Reverse(b.path.len()));
 
         Ok(Self {
             listen_addr,
@@ -172,8 +187,9 @@ impl Config {
             max_cache_size_bytes,
             default_ttl,
             eviction_policy,
-            cache_clear_cron: None, // config.toml 에는 cron 필드 미포함; 필요시 확장
+            cache_clear_cron,
             cache_clear_interval,
+            max_body_bytes,
         })
     }
 
@@ -252,6 +268,7 @@ mod tests {
             eviction_policy: EvictionPolicy::Lru,
             cache_clear_cron: None,
             cache_clear_interval: None,
+            max_body_bytes: None,
         }
     }
 

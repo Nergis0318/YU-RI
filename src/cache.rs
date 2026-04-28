@@ -1,8 +1,9 @@
 use anyhow::Result;
-use blake3;
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -13,6 +14,8 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 use tracing::debug;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Meta {
@@ -26,12 +29,20 @@ struct Meta {
 }
 
 #[derive(Debug, Clone)]
-pub struct CacheEntry {
-    pub bytes: Bytes,
+pub struct CacheFileEntry {
+    pub path: PathBuf,
+    pub size: u64,
     pub content_type: Option<String>,
-    pub is_fresh: bool, // true: TTL 내, false: stale (swr 허용)
+    pub is_fresh: bool,
     pub etag: Option<String>,
     pub created_at: u64,
+}
+
+pub struct CacheStoreOptions {
+    pub content_type: Option<String>,
+    pub ttl: Option<Duration>,
+    pub swr: Option<Duration>,
+    pub etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -65,6 +76,14 @@ impl DiskCache {
                 // meta 파일 읽고 last_access_at 갱신 (best-effort)
                 if let Ok(bytes) = tfs::read(&meta_path).await {
                     if let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) {
+                        let bin_path = meta_path.with_extension("bin");
+                        if tfs::metadata(&bin_path)
+                            .await
+                            .map(|m| m.len() != meta.size)
+                            .unwrap_or(true)
+                        {
+                            continue;
+                        }
                         meta.last_access_at = SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .unwrap()
@@ -100,7 +119,7 @@ impl DiskCache {
         // 비동기 eviction 워커
         let cache_for_evict = cache.clone();
         tokio::spawn(async move {
-            while let Some(_) = evict_rx.recv().await {
+            while evict_rx.recv().await.is_some() {
                 // 단순화: 신호 받으면 실행. (debouncing 추가 가능)
                 if let Err(e) = cache_for_evict.enforce_size_limit().await {
                     debug!(target: "cache", error=?e, "eviction failed");
@@ -146,99 +165,142 @@ impl DiskCache {
         if let Some(parent) = path.parent() {
             tfs::create_dir_all(parent).await?;
         }
-        let mut f = tfs::File::create(path).await?;
+        let temp_path = Self::temp_path_for(path);
+        let mut f = tfs::File::create(&temp_path).await?;
         f.write_all(data).await?;
         f.sync_all().await?;
+        tfs::rename(&temp_path, path).await?;
         Ok(())
     }
 
-    pub async fn get(&self, key: &str) -> Result<Option<CacheEntry>> {
-        let path = self.key_path(key);
-        let meta_path = path.with_extension("meta");
-        let data_path = path.with_extension("bin");
-        // 비동기 파일 존재 체크 (tokio::fs::metadata 사용)
-        let (data_exists, meta_exists) =
-            tokio::join!(tfs::metadata(&data_path), tfs::metadata(&meta_path));
-        if data_exists.is_err() || meta_exists.is_err() {
-            return Ok(None);
-        }
-        let meta_bytes = tfs::read(&meta_path).await.ok();
-        let data_bytes = tfs::read(&data_path).await.ok();
-        if let (Some(mb), Some(db)) = (meta_bytes, data_bytes) {
-            if let Ok(meta) = serde_json::from_slice::<Meta>(&mb) {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if now > meta.expires_at {
-                    // Fresh TTL 지난 후 swr window 확인 (stale 허용)
-                    if let Some(swr_end) = meta.swr_expires_at {
-                        if now <= swr_end {
-                            // stale → touch (LRU 유지)
-                            let _ = self.touch_tx.try_send(meta_path.clone());
-                            return Ok(Some(CacheEntry {
-                                bytes: Bytes::from(db),
-                                content_type: meta.content_type,
-                                is_fresh: false,
-                                etag: meta.etag,
-                                created_at: meta.created_at,
-                            }));
-                        }
-                    }
-                    // 완전 만료 → 파일 제거 (lazy cleanup)
-                    let base = meta_path.with_extension("");
-                    let _ = tfs::remove_file(base.with_extension("bin")).await;
-                    let _ = tfs::remove_file(&meta_path).await;
-                    debug!(target: "cache", key=%key, "expired entry removed");
-                    return Ok(None);
-                }
-                // Fresh → 비동기 touch
-                let _ = self.touch_tx.try_send(meta_path.clone());
-                return Ok(Some(CacheEntry {
-                    bytes: Bytes::from(db),
-                    content_type: meta.content_type,
-                    is_fresh: true,
-                    etag: meta.etag,
-                    created_at: meta.created_at,
-                }));
-            }
-        }
-        Ok(None)
+    fn temp_path_for(path: &Path) -> PathBuf {
+        let id = format!(
+            "{}.{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("{s}.{id}.tmp"))
+            .unwrap_or_else(|| format!("{id}.tmp"));
+        path.with_extension(extension)
     }
 
-    pub async fn put(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        content_type: Option<String>,
-        ttl: Option<Duration>,
-        swr: Option<Duration>,
-        etag: Option<String>,
-    ) -> Result<()> {
-        let _g = self.inner.lock().await; // ensure size ops consistent
+    pub async fn temp_data_path(&self, key: &str) -> Result<PathBuf> {
+        let path = Self::temp_path_for(&self.key_path(key).with_extension("bin"));
+        if let Some(parent) = path.parent() {
+            tfs::create_dir_all(parent).await?;
+        }
+        Ok(path)
+    }
+
+    pub async fn get_file(&self, key: &str) -> Result<Option<CacheFileEntry>> {
         let path = self.key_path(key);
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
-        let size = bytes.len() as u64;
+
+        let (data_meta, meta_bytes) =
+            tokio::join!(tfs::metadata(&data_path), tfs::read(&meta_path));
+        let (data_meta, meta_bytes) = match (data_meta, meta_bytes) {
+            (Ok(data_meta), Ok(meta_bytes)) if data_meta.is_file() => (data_meta, meta_bytes),
+            _ => return Ok(None),
+        };
+
+        let meta = match serde_json::from_slice::<Meta>(&meta_bytes) {
+            Ok(meta) => meta,
+            Err(_) => {
+                let _ = tfs::remove_file(&data_path).await;
+                let _ = tfs::remove_file(&meta_path).await;
+                debug!(target: "cache", key=%key, "removed corrupt meta");
+                return Ok(None);
+            }
+        };
+
+        if data_meta.len() != meta.size {
+            let _ = tfs::remove_file(&data_path).await;
+            let _ = tfs::remove_file(&meta_path).await;
+            debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
+            return Ok(None);
+        }
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let ttl_dur = ttl.unwrap_or(self.default_ttl);
+        let is_fresh = if now > meta.expires_at {
+            if let Some(swr_end) = meta.swr_expires_at
+                && now <= swr_end
+            {
+                false
+            } else {
+                let _ = tfs::remove_file(&data_path).await;
+                let _ = tfs::remove_file(&meta_path).await;
+                debug!(target: "cache", key=%key, "expired entry removed");
+                return Ok(None);
+            }
+        } else {
+            true
+        };
+
+        let _ = self.touch_tx.try_send(meta_path);
+        Ok(Some(CacheFileEntry {
+            path: data_path,
+            size: meta.size,
+            content_type: meta.content_type,
+            is_fresh,
+            etag: meta.etag,
+            created_at: meta.created_at,
+        }))
+    }
+
+    pub async fn put_file(
+        &self,
+        key: &str,
+        temp_path: &Path,
+        size: u64,
+        options: CacheStoreOptions,
+    ) -> Result<()> {
+        let _g = self.inner.lock().await;
+        let path = self.key_path(key);
+        let meta_path = path.with_extension("meta");
+        let data_path = path.with_extension("bin");
+        if let Some(parent) = data_path.parent() {
+            tfs::create_dir_all(parent).await?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ttl_dur = options.ttl.unwrap_or(self.default_ttl);
         let meta = Meta {
             expires_at: now + ttl_dur.as_secs(),
             created_at: now,
             size,
-            content_type,
-            swr_expires_at: swr.map(|d| now + ttl_dur.as_secs() + d.as_secs()),
+            content_type: options.content_type,
+            swr_expires_at: options.swr.map(|d| now + ttl_dur.as_secs() + d.as_secs()),
             last_access_at: now,
-            etag,
+            etag: options.etag,
         };
         let meta_json = serde_json::to_vec(&meta)?;
-        Self::write_file(&data_path, bytes).await?;
-        Self::write_file(&meta_path, &meta_json).await?;
+        let meta_temp_path = Self::temp_path_for(&meta_path);
+        let mut meta_file = tfs::File::create(&meta_temp_path).await?;
+        meta_file.write_all(&meta_json).await?;
+        meta_file.sync_all().await?;
+        drop(meta_file);
 
-        // 비동기 eviction 트리거
+        let _ = tfs::remove_file(&meta_path).await;
+        if let Err(e) = tfs::rename(temp_path, &data_path).await {
+            let _ = tfs::remove_file(&meta_temp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = tfs::rename(&meta_temp_path, &meta_path).await {
+            let _ = tfs::remove_file(&meta_temp_path).await;
+            let _ = tfs::remove_file(&data_path).await;
+            return Err(e.into());
+        }
+
         let _ = self.evict_tx.try_send(());
 
         Ok(())
@@ -281,34 +343,29 @@ impl DiskCache {
                 }
                 if entry.path().extension().and_then(|s| s.to_str()) == Some("meta") {
                     let meta_bytes = tfs::read(entry.path()).await.ok();
-                    if let Some(mb) = meta_bytes {
-                        if let Ok(meta) = serde_json::from_slice::<Meta>(&mb) {
-                            let base = entry.path().with_extension("");
-                            let bin = base.with_extension("bin");
-                            if bin.exists() {
-                                // 만료( + swr 종료) 된 항목은 즉시 삭제 후 스킵
-                                let fully_expired = if now > meta.expires_at {
-                                    if let Some(swr_end) = meta.swr_expires_at {
-                                        now > swr_end
-                                    } else {
-                                        true
-                                    }
+                    if let Some(mb) = meta_bytes
+                        && let Ok(meta) = serde_json::from_slice::<Meta>(&mb)
+                    {
+                        let base = entry.path().with_extension("");
+                        let bin = base.with_extension("bin");
+                        if tfs::metadata(&bin).await.is_ok() {
+                            // 만료( + swr 종료) 된 항목은 즉시 삭제 후 스킵
+                            let fully_expired = if now > meta.expires_at {
+                                if let Some(swr_end) = meta.swr_expires_at {
+                                    now > swr_end
                                 } else {
-                                    false
-                                };
-                                if fully_expired {
-                                    let _ = tfs::remove_file(bin).await;
-                                    let _ = tfs::remove_file(entry.path()).await;
-                                    continue;
+                                    true
                                 }
-                                total += meta.size;
-                                entries.push((
-                                    base,
-                                    meta.created_at,
-                                    meta.size,
-                                    meta.last_access_at,
-                                ));
+                            } else {
+                                false
+                            };
+                            if fully_expired {
+                                let _ = tfs::remove_file(bin).await;
+                                let _ = tfs::remove_file(entry.path()).await;
+                                continue;
                             }
+                            total += meta.size;
+                            entries.push((base, meta.created_at, meta.size, meta.last_access_at));
                         }
                     }
                 }
@@ -327,7 +384,7 @@ impl DiskCache {
                 entries.sort_by_key(|(_, _created, _size, last_access)| *last_access);
             }
             crate::config::EvictionPolicy::Size => {
-                entries.sort_by(|a, b| b.2.cmp(&a.2)); // 큰 것 먼저 제거
+                entries.sort_by_key(|b| std::cmp::Reverse(b.2)); // 큰 것 먼저 제거
             }
             crate::config::EvictionPolicy::LruSize => {
                 // last_access 오래된 것 우선, 동일 last_access 내에서는 큰 size 우선 제거
@@ -361,7 +418,7 @@ impl DiskCache {
     // base_key 에 대한 Vary 헤더 이름 목록 조회 (없으면 None)
     pub async fn get_vary_header_names(&self, base_key: &str) -> Result<Option<Vec<String>>> {
         let path = self.vary_index_path(base_key);
-        if !path.exists() {
+        if tfs::metadata(&path).await.is_err() {
             return Ok(None);
         }
         let bytes = match tfs::read(&path).await {
@@ -369,7 +426,7 @@ impl DiskCache {
             Err(_) => return Ok(None),
         };
         let names: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
-        if names.is_empty() {
+        if names.is_empty() || names.iter().any(|name| name == "*") {
             return Ok(None);
         }
         Ok(Some(names))
@@ -381,13 +438,8 @@ impl DiskCache {
             return Ok(());
         }
         let path = self.vary_index_path(base_key);
-        if let Some(parent) = path.parent() {
-            tfs::create_dir_all(parent).await?;
-        }
         let data = serde_json::to_vec(names)?;
-        let mut f = tfs::File::create(path).await?;
-        f.write_all(&data).await?;
-        f.sync_all().await?;
+        Self::write_file(&path, &data).await?;
         Ok(())
     }
 }

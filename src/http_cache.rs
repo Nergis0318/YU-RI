@@ -67,10 +67,10 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
                 if let Ok(v) = rest.parse::<i64>() {
                     max_age = Some(v.max(0));
                 }
-            } else if let Some(rest) = token.strip_prefix("stale-while-revalidate=") {
-                if let Ok(v) = rest.parse::<i64>() {
-                    swr = Some(v.max(0));
-                }
+            } else if let Some(rest) = token.strip_prefix("stale-while-revalidate=")
+                && let Ok(v) = rest.parse::<i64>()
+            {
+                swr = Some(v.max(0));
             }
         }
         let chosen = s_maxage.or(max_age);
@@ -80,11 +80,11 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
                 return TtlDecision::not_cacheable();
             }
             let mut d = TtlDecision::with_ttl(Duration::from_secs(sec as u64));
-            if let Some(s) = swr {
-                if s > 0 {
-                    d.stale_while_revalidate = Some(Duration::from_secs(s as u64));
-                    debug!(target: "http_cache", ttl_secs = sec, swr_secs = s, "Derived TTL with stale-while-revalidate");
-                }
+            if let Some(s) = swr
+                && s > 0
+            {
+                d.stale_while_revalidate = Some(Duration::from_secs(s as u64));
+                debug!(target: "http_cache", ttl_secs = sec, swr_secs = s, "Derived TTL with stale-while-revalidate");
             }
             if d.stale_while_revalidate.is_none() {
                 debug!(target: "http_cache", ttl_secs = sec, "Derived TTL from Cache-Control");
@@ -93,22 +93,22 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
         }
     }
     // Expires 처리 (Cache-Control max-age 없을 때만)
-    if let Some(exp_val) = headers.get("Expires").and_then(|v| v.to_str().ok()) {
-        if let Ok(exp_time) = httpdate::parse_http_date(exp_val) {
-            // httpdate crate
-            if let Ok(diff) = exp_time.duration_since(now) {
-                // 0 초면 비캐시로 간주 (혹은 default? 여기선 비캐시)
-                if diff.as_secs() == 0 {
-                    debug!(target: "http_cache", expires = exp_val, "Expires header is now => non-cacheable");
-                    return TtlDecision::not_cacheable();
-                }
-                debug!(target: "http_cache", expires = exp_val, ttl_secs = diff.as_secs(), "Derived TTL from Expires header");
-                return TtlDecision::with_ttl(diff);
-            } else {
-                // 이미 지난날 => 비캐시
-                debug!(target: "http_cache", expires = exp_val, "Expires header is in the past => non-cacheable");
+    if let Some(exp_val) = headers.get("Expires").and_then(|v| v.to_str().ok())
+        && let Ok(exp_time) = httpdate::parse_http_date(exp_val)
+    {
+        // httpdate crate
+        if let Ok(diff) = exp_time.duration_since(now) {
+            // 0 초면 비캐시로 간주 (혹은 default? 여기선 비캐시)
+            if diff.as_secs() == 0 {
+                debug!(target: "http_cache", expires = exp_val, "Expires header is now => non-cacheable");
                 return TtlDecision::not_cacheable();
             }
+            debug!(target: "http_cache", expires = exp_val, ttl_secs = diff.as_secs(), "Derived TTL from Expires header");
+            return TtlDecision::with_ttl(diff);
+        } else {
+            // 이미 지난날 => 비캐시
+            debug!(target: "http_cache", expires = exp_val, "Expires header is in the past => non-cacheable");
+            return TtlDecision::not_cacheable();
         }
     }
     // 기본
