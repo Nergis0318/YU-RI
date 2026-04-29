@@ -1,4 +1,4 @@
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.95-trixie AS builder
 
 RUN apt update -y && apt install -y musl-tools && rustup target add x86_64-unknown-linux-musl
 
