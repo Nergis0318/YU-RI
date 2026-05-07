@@ -4,6 +4,7 @@ use crate::http_cache::derive_ttl;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, header};
+use httpdate;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -12,18 +13,31 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 use std::{io::SeekFrom, path::PathBuf, sync::Arc};
 use tokio::{
     fs as tfs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpListener,
+    sync::broadcast,
 };
 use tracing::{debug, info, warn};
 
 type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
-type SharedState = Arc<(Config, DiskCache, HttpClient, Arc<CacheStats>)>;
+
+struct AppState {
+    config: Config,
+    cache: DiskCache,
+    client: HttpClient,
+    stats: Arc<CacheStats>,
+    /// 동시 캐시 미스 코얼레싱: 진행 중인 업스트림 요청을 기다리는 대기자들에게 결과 브로드캐스트
+    inflight: StdMutex<HashMap<String, broadcast::Sender<()>>>,
+}
+
+type SharedState = Arc<AppState>;
 
 const USER_AGENT_STR: &str = concat!(
     "YU-RI/",
@@ -137,17 +151,23 @@ pub async fn run(config: Config) -> Result<()> {
     let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
 
     let stats = Arc::new(CacheStats::default());
-    let shared: SharedState = Arc::new((config, cache, client, stats));
+    let shared: SharedState = Arc::new(AppState {
+        config,
+        cache,
+        client,
+        stats,
+        inflight: StdMutex::new(HashMap::new()),
+    });
 
     // Cron Cache Clear Scheduler (Optional)
-    if let Some(cron_expr) = shared.0.cache_clear_cron.clone() {
+    if let Some(cron_expr) = shared.config.cache_clear_cron.clone() {
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
         let shared_clone = shared.clone();
         let job = tokio_cron_scheduler::Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
             let shared_inner = shared_clone.clone();
             Box::pin(async move {
                 tracing::info!("Running scheduled cache clear");
-                if let Err(e) = shared_inner.1.clear_all().await {
+                if let Err(e) = shared_inner.cache.clear_all().await {
                     tracing::warn!(error=?e, "cache clear failed");
                 }
             })
@@ -158,7 +178,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     // Interval Cache Clear (Optional)
-    if let Some(interval) = shared.0.cache_clear_interval {
+    if let Some(interval) = shared.config.cache_clear_interval {
         let shared_clone = shared.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -166,7 +186,7 @@ pub async fn run(config: Config) -> Result<()> {
             loop {
                 ticker.tick().await;
                 tracing::info!(?interval, "Interval cache clear running");
-                if let Err(e) = shared_clone.1.clear_all().await {
+                if let Err(e) = shared_clone.cache.clear_all().await {
                     tracing::warn!(error=?e, "interval cache clear failed");
                 }
             }
@@ -174,7 +194,7 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::info!(every_secs=%interval.as_secs(), "Cache clear interval enabled");
     }
 
-    let addr = shared.0.listen_addr.clone();
+    let addr = shared.config.listen_addr.clone();
     let listener = TcpListener::bind(&addr).await?;
     info!(?addr, "Listening");
 
@@ -252,7 +272,7 @@ async fn handle(
     let start_time = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let (config, cache, client, stats) = (&shared.0, &shared.1, &shared.2, &shared.3);
+    let (config, cache, client, stats) = (&shared.config, &shared.cache, &shared.client, &shared.stats);
 
     // Health check
     if path == "/_health" || path == "/_health/" {
@@ -268,12 +288,16 @@ async fn handle(
 
     // Stats endpoint
     if path == "/_stats" || path == "/_stats/" {
+        let (cache_bytes, cache_entries) = cache.size_info().await;
         let body = serde_json::json!({
             "hits": stats.hits.load(Ordering::Relaxed),
             "stale_hits": stats.stale_hits.load(Ordering::Relaxed),
             "misses": stats.misses.load(Ordering::Relaxed),
             "not_modified": stats.not_modified.load(Ordering::Relaxed),
             "errors": stats.errors.load(Ordering::Relaxed),
+            "cache_bytes": cache_bytes,
+            "cache_entries": cache_entries,
+            "max_cache_bytes": config.max_cache_size_bytes,
         });
         let mut resp = Response::new(full(body.to_string()));
         *resp.status_mut() = StatusCode::OK;
@@ -360,52 +384,77 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let if_modified_since = req
+        .headers()
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok());
+
     // Cache lookup
     if let Ok(Some(entry)) = cache.get_file(&final_cache_key).await {
         // Conditional request: If-None-Match
-        if let (Some(req_etag), Some(entry_etag)) = (&if_none_match, &entry.etag) {
+        let etag_matches = if let (Some(req_etag), Some(entry_etag)) = (&if_none_match, &entry.etag) {
             let req_etag_clean = req_etag.trim().trim_start_matches("W/");
             let entry_etag_clean = entry_etag.trim().trim_start_matches("W/");
-            if req_etag_clean == entry_etag_clean || req_etag == "*" {
-                let mut resp = Response::new(empty());
-                *resp.status_mut() = StatusCode::NOT_MODIFIED;
-                if let Some(ct) = &entry.content_type
-                    && let Ok(hv) = ct.parse()
-                {
-                    resp.headers_mut().insert(header::CONTENT_TYPE, hv);
-                }
-                if let Ok(hv) = entry_etag.parse() {
-                    resp.headers_mut().insert(header::ETAG, hv);
-                }
-                let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
-                add_cache_headers(resp.headers_mut(), cache_status, entry.created_at);
+            req_etag_clean == entry_etag_clean || req_etag == "*"
+        } else {
+            false
+        };
 
-                let is_fresh = entry.is_fresh;
-                if is_fresh {
-                    stats.hits.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.stale_hits.fetch_add(1, Ordering::Relaxed);
-                }
-                stats.not_modified.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    method = %method,
-                    path = %path,
-                    status = 304,
-                    cache = cache_status,
-                    duration_ms = %start_time.elapsed().as_millis(),
-                    "Request completed (304 Not Modified)"
-                );
-
-                if !is_fresh {
-                    let bg_shared = shared.clone();
-                    let bg_key = final_cache_key.clone();
-                    let bg_base_key = base_cache_key.clone();
-                    tokio::spawn(async move {
-                        let _ = background_refresh(bg_key, bg_base_key, bg_shared).await;
-                    });
-                }
-                return Ok(resp);
+        // Conditional request: If-Modified-Since (only when no ETag match)
+        let ims_not_modified = if !etag_matches {
+            if let (Some(ims), Some(lm_str)) = (if_modified_since, &entry.last_modified) {
+                httpdate::parse_http_date(lm_str)
+                    .map(|lm| lm <= ims)
+                    .unwrap_or(false)
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        if etag_matches || ims_not_modified {
+            let mut resp = Response::new(empty());
+            *resp.status_mut() = StatusCode::NOT_MODIFIED;
+            if let Some(ct) = &entry.content_type
+                && let Ok(hv) = ct.parse()
+            {
+                resp.headers_mut().insert(header::CONTENT_TYPE, hv);
+            }
+            if let Some(etag) = &entry.etag
+                && let Ok(hv) = etag.parse()
+            {
+                resp.headers_mut().insert(header::ETAG, hv);
+            }
+            if let Some(lm) = &entry.last_modified
+                && let Ok(hv) = lm.parse()
+            {
+                resp.headers_mut().insert(header::LAST_MODIFIED, hv);
+            }
+            let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
+            add_cache_headers(resp.headers_mut(), cache_status, entry.created_at);
+
+            let is_fresh = entry.is_fresh;
+            if is_fresh {
+                stats.hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            stats.not_modified.fetch_add(1, Ordering::Relaxed);
+            info!(
+                method = %method,
+                path = %path,
+                status = 304,
+                cache = cache_status,
+                duration_ms = %start_time.elapsed().as_millis(),
+                "Request completed (304 Not Modified)"
+            );
+
+            if !is_fresh {
+                spawn_background_refresh(final_cache_key.clone(), base_cache_key.clone(), shared.clone());
+            }
+            return Ok(resp);
         }
 
         // Serve cached content (with optional range slicing)
@@ -445,6 +494,11 @@ async fn handle(
         {
             resp.headers_mut().insert(header::ETAG, hv);
         }
+        if let Some(lm) = &entry.last_modified
+            && let Ok(hv) = lm.parse()
+        {
+            resp.headers_mut().insert(header::LAST_MODIFIED, hv);
+        }
         let cache_status = if entry.is_fresh { "HIT" } else { "STALE" };
         add_cache_headers(resp.headers_mut(), cache_status, entry.created_at);
         for (k, v) in extra_headers {
@@ -459,12 +513,7 @@ async fn handle(
         }
 
         if !is_fresh {
-            let bg_shared = shared.clone();
-            let bg_key = final_cache_key.clone();
-            let bg_base_key = base_cache_key.clone();
-            tokio::spawn(async move {
-                let _ = background_refresh(bg_key, bg_base_key, bg_shared).await;
-            });
+            spawn_background_refresh(final_cache_key.clone(), base_cache_key.clone(), shared.clone());
         }
         info!(
             method = %method,
@@ -478,6 +527,82 @@ async fn handle(
     }
 
     stats.misses.fetch_add(1, Ordering::Relaxed);
+
+    // MISS: 동시 요청 코얼레싱 (GET, 범위 요청 제외)
+    // 이미 진행 중인 업스트림 요청이 있으면 완료를 기다린 후 캐시에서 서빙
+    if !is_head && range_request.is_none() {
+        let mut rx = {
+            let mut inflight = shared.inflight.lock().unwrap();
+            if let Some(tx) = inflight.get(&final_cache_key) {
+                Some(tx.subscribe())
+            } else {
+                let (tx, _) = broadcast::channel::<()>(1);
+                inflight.insert(final_cache_key.clone(), tx);
+                None
+            }
+        };
+
+        if let Some(ref mut rx) = rx {
+            // 다른 요청이 업스트림 fetch를 처리 중 — 완료 신호를 기다림
+            let _ = rx.recv().await;
+            // 캐시에서 다시 조회
+            if let Ok(Some(entry)) = cache.get_file(&final_cache_key).await {
+                let range_result = resolve_range(entry.size, range_request);
+                let mut extra_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
+                extra_headers.push((
+                    header::ACCEPT_RANGES,
+                    header::HeaderValue::from_static("bytes"),
+                ));
+                if let Some(cr) = &range_result.content_range
+                    && let Ok(hv) = header::HeaderValue::from_str(cr)
+                {
+                    extra_headers.push((header::CONTENT_RANGE, hv));
+                }
+                let response_body = if range_result.len == 0 {
+                    empty()
+                } else {
+                    stream_file(entry.path.clone(), range_result.start, range_result.len)
+                };
+                let mut resp = Response::new(response_body);
+                *resp.status_mut() = range_result.status;
+                if let Ok(hv) = header::HeaderValue::from_str(&range_result.len.to_string()) {
+                    resp.headers_mut().insert(header::CONTENT_LENGTH, hv);
+                }
+                if let Some(ct) = &entry.content_type {
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        ct.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+                    );
+                }
+                if let Some(etag) = &entry.etag
+                    && let Ok(hv) = etag.parse()
+                {
+                    resp.headers_mut().insert(header::ETAG, hv);
+                }
+                if let Some(lm) = &entry.last_modified
+                    && let Ok(hv) = lm.parse()
+                {
+                    resp.headers_mut().insert(header::LAST_MODIFIED, hv);
+                }
+                add_cache_headers(resp.headers_mut(), "HIT", entry.created_at);
+                for (k, v) in extra_headers {
+                    resp.headers_mut().insert(k, v);
+                }
+                stats.hits.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    method = %method,
+                    path = %path,
+                    status = %resp.status().as_u16(),
+                    cache = "HIT",
+                    coalesced = true,
+                    duration_ms = %start_time.elapsed().as_millis(),
+                    "Request completed (coalesced)"
+                );
+                return Ok(resp);
+            }
+            // 업스트림 요청이 실패했거나 캐시 불가였을 경우 → 직접 업스트림 재시도
+        }
+    }
 
     // MISS: Fetch from upstream
     let ua_header = http::HeaderValue::from_static(USER_AGENT_STR);
@@ -553,6 +678,11 @@ async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
+            let upstream_last_modified = headers
+                .get(header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             if is_head {
                 let mut resp = Response::new(empty());
                 *resp.status_mut() = status;
@@ -576,6 +706,9 @@ async fn handle(
                 }
                 if let Some(etag_val) = headers.get(header::ETAG) {
                     resp.headers_mut().insert(header::ETAG, etag_val.clone());
+                }
+                if let Some(lm_val) = headers.get(header::LAST_MODIFIED) {
+                    resp.headers_mut().insert(header::LAST_MODIFIED, lm_val.clone());
                 }
                 info!(
                     method = %method,
@@ -620,12 +753,16 @@ async fn handle(
             if let Some(etag_val) = headers.get(header::ETAG) {
                 resp.headers_mut().insert(header::ETAG, etag_val.clone());
             }
+            if let Some(lm_val) = headers.get(header::LAST_MODIFIED) {
+                resp.headers_mut().insert(header::LAST_MODIFIED, lm_val.clone());
+            }
             if let Some(vary_val) = headers.get(header::VARY) {
                 resp.headers_mut().insert(header::VARY, vary_val.clone());
             }
 
             let cache_cloned = cache.clone();
             let etag_for_cache = upstream_etag.clone();
+            let lm_for_cache = upstream_last_modified.clone();
             let mut up_body = up_resp.into_body();
             let max_body_limit = max_cacheable_body_bytes(config) as u64;
             let should_cache_body = decision.cacheable
@@ -634,6 +771,8 @@ async fn handle(
                 && !vary_all;
             let method_for_log = method.clone();
             let path_for_log = path.clone();
+            let inflight_key = if should_cache_body { Some(final_cache_key.clone()) } else { None };
+            let shared_for_inflight = shared.clone();
 
             tokio::spawn(async move {
                 let mut temp_path = None;
@@ -729,6 +868,7 @@ async fn handle(
                                         ttl: decision.ttl,
                                         swr: decision.stale_while_revalidate,
                                         etag: etag_for_cache,
+                                        last_modified: lm_for_cache,
                                     },
                                 )
                                 .await
@@ -745,6 +885,15 @@ async fn handle(
                     }
                 }
 
+                // inflight 엔트리 제거 및 대기 중인 요청에 완료 신호 전달
+                if let Some(ref key) = inflight_key {
+                    if let Ok(mut map) = shared_for_inflight.inflight.lock() {
+                        if let Some(tx) = map.remove(key) {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+
                 info!(
                     method = %method_for_log,
                     path = %path_for_log,
@@ -758,6 +907,12 @@ async fn handle(
             Ok(resp)
         }
         Err(err) => {
+            // 업스트림 오류 시에도 inflight 정리
+            if let Ok(mut map) = shared.inflight.lock() {
+                if let Some(tx) = map.remove(&final_cache_key) {
+                    let _ = tx.send(());
+                }
+            }
             stats.errors.fetch_add(1, Ordering::Relaxed);
             warn!(
                 error = ?err,
@@ -778,13 +933,18 @@ async fn handle(
     }
 }
 
+fn spawn_background_refresh(cache_key: String, upstream_url: String, shared: SharedState) {
+    tokio::spawn(async move {
+        let _ = background_refresh(cache_key, upstream_url, shared).await;
+    });
+}
+
 async fn background_refresh(
     cache_key: String,
-    base_cache_key: String,
+    upstream_url: String,
     shared: SharedState,
 ) -> Result<(), anyhow::Error> {
-    let (config, cache, client, _stats) = (&shared.0, &shared.1, &shared.2, &shared.3);
-    let upstream_url = base_cache_key;
+    let (config, cache, client) = (&shared.config, &shared.cache, &shared.client);
 
     let upstream_req = Request::builder()
         .method(http::Method::GET)
@@ -811,6 +971,10 @@ async fn background_refresh(
             .map(|s| s.to_string());
         let etag = headers
             .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let last_modified = headers
+            .get(header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let max_body_limit = max_cacheable_body_bytes(config) as u64;
@@ -861,6 +1025,7 @@ async fn background_refresh(
                         ttl: decision.ttl,
                         swr: decision.stale_while_revalidate,
                         etag,
+                        last_modified,
                     },
                 )
                 .await
@@ -879,6 +1044,10 @@ async fn background_refresh(
 fn simple(code: StatusCode, msg: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
     let mut r = Response::new(full(msg.to_string()));
     *r.status_mut() = code;
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     r
 }
 

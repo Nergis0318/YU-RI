@@ -23,9 +23,11 @@ struct Meta {
     created_at: u64,
     size: u64,
     pub content_type: Option<String>,
-    swr_expires_at: Option<u64>, // stale-while-revalidate 만료 시각 (expires_at 이후 추가 허용 구간)
-    last_access_at: u64,         // LRU 용 (get 시 갱신)
-    pub etag: Option<String>,    // ETag 헤더 (조건부 요청 지원용)
+    swr_expires_at: Option<u64>,
+    last_access_at: u64,
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>, // Last-Modified 헤더값 (RFC 7232 조건부 요청용)
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub struct CacheFileEntry {
     pub is_fresh: bool,
     pub etag: Option<String>,
     pub created_at: u64,
+    pub last_modified: Option<String>,
 }
 
 pub struct CacheStoreOptions {
@@ -43,6 +46,7 @@ pub struct CacheStoreOptions {
     pub ttl: Option<Duration>,
     pub swr: Option<Duration>,
     pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
 
 #[derive(Clone)]
@@ -128,6 +132,28 @@ impl DiskCache {
         });
 
         Ok(cache)
+    }
+
+    /// 현재 캐시 사용량 (bytes) 과 항목 수 반환 (best-effort, 만료 항목 포함)
+    pub async fn size_info(&self) -> (u64, u64) {
+        let mut total_bytes = 0u64;
+        let mut entries = 0u64;
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(mut rd) = tfs::read_dir(&dir).await else { continue };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let Ok(ty) = entry.file_type().await else { continue };
+                if ty.is_dir() {
+                    stack.push(entry.path());
+                } else if entry.path().extension().and_then(|s| s.to_str()) == Some("bin") {
+                    if let Ok(m) = tfs::metadata(entry.path()).await {
+                        total_bytes += m.len();
+                        entries += 1;
+                    }
+                }
+            }
+        }
+        (total_bytes, entries)
     }
 
     /// 전체 캐시 비우기 (디렉토리 내 .bin / .meta / .vary 파일 삭제)
@@ -251,6 +277,7 @@ impl DiskCache {
             is_fresh,
             etag: meta.etag,
             created_at: meta.created_at,
+            last_modified: meta.last_modified,
         }))
     }
 
@@ -282,6 +309,7 @@ impl DiskCache {
             swr_expires_at: options.swr.map(|d| now + ttl_dur.as_secs() + d.as_secs()),
             last_access_at: now,
             etag: options.etag,
+            last_modified: options.last_modified,
         };
         let meta_json = serde_json::to_vec(&meta)?;
         let meta_temp_path = Self::temp_path_for(&meta_path);
@@ -307,25 +335,8 @@ impl DiskCache {
     }
 
     async fn enforce_size_limit(&self) -> Result<()> {
-        // _g lock removed here because we want this to be background and not block put?
-        // But if multiple evictions run, it might be weird.
-        // Also self.inner is Mutex<()>. If we lock it here, we block 'put' if 'put' locks it.
-        // Wait, 'put' locks it to write file. Writing file is fast.
-        // enforce_size_limit walks dir, which is slow.
-        // If we lock here, we block 'put' while walking dir. That defeats the purpose.
-        // So we should NOT lock self.inner for the whole duration.
-        // Maybe we don't need to lock at all for reading?
-        // Deletion might race with new writes?
-        // If we delete a file that is being written... temporary files?
-        // 'put' writes to temp then rename? No, it writes directly.
-        // Ideally 'put' writes to temp.
-        // Current impl writes directly.
-        // If eviction deletes a file just as it's written?
-        // 'put' overwrites.
-        // Eviction finds files.
-        // If we list files, then delete oldest.
-        // It's acceptable race for cache.
-
+        // Intentionally not holding self.inner lock for the full scan: the walk is slow and
+        // would block put(). Racy deletions are acceptable for a cache.
         let mut entries: Vec<(PathBuf, u64, u64, u64)> = Vec::new(); // (base_path, created_at, size, last_access_at)
         let mut total = 0u64;
         let mut stack = vec![self.root.clone()];

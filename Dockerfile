@@ -10,14 +10,8 @@ COPY . .
 
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
-FROM debian:stable-slim
+FROM scratch
 
-ARG DEBIAN_FRONTEND=noninteractive
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/yu-ri /yu-ri
 
-RUN apt update -y && apt upgrade -y && apt install -y ca-certificates
-
-WORKDIR /app
-
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/yu-ri .
-
-CMD ["./yu-ri"]
+CMD ["/yu-ri"]
