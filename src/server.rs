@@ -3,9 +3,10 @@ use crate::config::Config;
 use crate::http_cache::derive_ttl;
 use anyhow::Result;
 use bytes::Bytes;
+use dashmap::DashMap;
 use http::{Request, Response, StatusCode, header};
-use httpdate;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use httpdate;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -13,9 +14,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 use std::{io::SeekFrom, path::PathBuf, sync::Arc};
 use tokio::{
@@ -33,8 +32,7 @@ struct AppState {
     cache: DiskCache,
     client: HttpClient,
     stats: Arc<CacheStats>,
-    /// 동시 캐시 미스 코얼레싱: 진행 중인 업스트림 요청을 기다리는 대기자들에게 결과 브로드캐스트
-    inflight: StdMutex<HashMap<String, broadcast::Sender<()>>>,
+    inflight: Arc<DashMap<String, broadcast::Sender<()>>>,
 }
 
 type SharedState = Arc<AppState>;
@@ -68,7 +66,7 @@ fn empty() -> BoxBody<Bytes, hyper::Error> {
 
 fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxBody<Bytes, hyper::Error> {
     let (tx, body_stream) =
-        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(32);
+        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(64);
 
     tokio::spawn(async move {
         let result = async {
@@ -76,7 +74,7 @@ fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxBody<Bytes, hyper::Err
             file.seek(SeekFrom::Start(start)).await?;
 
             let mut remaining = len;
-            let mut buf = vec![0_u8; 64 * 1024];
+            let mut buf = vec![0_u8; 128 * 1024];
             while remaining > 0 {
                 let read_len = remaining.min(buf.len() as u64) as usize;
                 let n = file.read(&mut buf[..read_len]).await?;
@@ -156,7 +154,7 @@ pub async fn run(config: Config) -> Result<()> {
         cache,
         client,
         stats,
-        inflight: StdMutex::new(HashMap::new()),
+        inflight: Arc::new(DashMap::new()),
     });
 
     // Cron Cache Clear Scheduler (Optional)
@@ -272,7 +270,8 @@ async fn handle(
     let start_time = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let (config, cache, client, stats) = (&shared.config, &shared.cache, &shared.client, &shared.stats);
+    let (config, cache, client, stats) =
+        (&shared.config, &shared.cache, &shared.client, &shared.stats);
 
     // Health check
     if path == "/_health" || path == "/_health/" {
@@ -393,7 +392,8 @@ async fn handle(
     // Cache lookup
     if let Ok(Some(entry)) = cache.get_file(&final_cache_key).await {
         // Conditional request: If-None-Match
-        let etag_matches = if let (Some(req_etag), Some(entry_etag)) = (&if_none_match, &entry.etag) {
+        let etag_matches = if let (Some(req_etag), Some(entry_etag)) = (&if_none_match, &entry.etag)
+        {
             let req_etag_clean = req_etag.trim().trim_start_matches("W/");
             let entry_etag_clean = entry_etag.trim().trim_start_matches("W/");
             req_etag_clean == entry_etag_clean || req_etag == "*"
@@ -452,7 +452,11 @@ async fn handle(
             );
 
             if !is_fresh {
-                spawn_background_refresh(final_cache_key.clone(), base_cache_key.clone(), shared.clone());
+                spawn_background_refresh(
+                    final_cache_key.clone(),
+                    base_cache_key.clone(),
+                    shared.clone(),
+                );
             }
             return Ok(resp);
         }
@@ -513,7 +517,11 @@ async fn handle(
         }
 
         if !is_fresh {
-            spawn_background_refresh(final_cache_key.clone(), base_cache_key.clone(), shared.clone());
+            spawn_background_refresh(
+                final_cache_key.clone(),
+                base_cache_key.clone(),
+                shared.clone(),
+            );
         }
         info!(
             method = %method,
@@ -532,12 +540,11 @@ async fn handle(
     // 이미 진행 중인 업스트림 요청이 있으면 완료를 기다린 후 캐시에서 서빙
     if !is_head && range_request.is_none() {
         let mut rx = {
-            let mut inflight = shared.inflight.lock().unwrap();
-            if let Some(tx) = inflight.get(&final_cache_key) {
+            if let Some(tx) = shared.inflight.get(&final_cache_key) {
                 Some(tx.subscribe())
             } else {
                 let (tx, _) = broadcast::channel::<()>(1);
-                inflight.insert(final_cache_key.clone(), tx);
+                shared.inflight.insert(final_cache_key.clone(), tx);
                 None
             }
         };
@@ -571,7 +578,8 @@ async fn handle(
                 if let Some(ct) = &entry.content_type {
                     resp.headers_mut().insert(
                         header::CONTENT_TYPE,
-                        ct.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+                        ct.parse()
+                            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
                     );
                 }
                 if let Some(etag) = &entry.etag
@@ -708,7 +716,8 @@ async fn handle(
                     resp.headers_mut().insert(header::ETAG, etag_val.clone());
                 }
                 if let Some(lm_val) = headers.get(header::LAST_MODIFIED) {
-                    resp.headers_mut().insert(header::LAST_MODIFIED, lm_val.clone());
+                    resp.headers_mut()
+                        .insert(header::LAST_MODIFIED, lm_val.clone());
                 }
                 info!(
                     method = %method,
@@ -723,7 +732,7 @@ async fn handle(
 
             // ── Streaming response with side-effect caching ───
             let (tx, body_stream) =
-                tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(32);
+                tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(64);
 
             let stream_body = http_body_util::StreamBody::new(
                 tokio_stream::wrappers::ReceiverStream::new(body_stream),
@@ -754,7 +763,8 @@ async fn handle(
                 resp.headers_mut().insert(header::ETAG, etag_val.clone());
             }
             if let Some(lm_val) = headers.get(header::LAST_MODIFIED) {
-                resp.headers_mut().insert(header::LAST_MODIFIED, lm_val.clone());
+                resp.headers_mut()
+                    .insert(header::LAST_MODIFIED, lm_val.clone());
             }
             if let Some(vary_val) = headers.get(header::VARY) {
                 resp.headers_mut().insert(header::VARY, vary_val.clone());
@@ -771,7 +781,11 @@ async fn handle(
                 && !vary_all;
             let method_for_log = method.clone();
             let path_for_log = path.clone();
-            let inflight_key = if should_cache_body { Some(final_cache_key.clone()) } else { None };
+            let inflight_key = if should_cache_body {
+                Some(final_cache_key.clone())
+            } else {
+                None
+            };
             let shared_for_inflight = shared.clone();
 
             tokio::spawn(async move {
@@ -887,10 +901,8 @@ async fn handle(
 
                 // inflight 엔트리 제거 및 대기 중인 요청에 완료 신호 전달
                 if let Some(ref key) = inflight_key {
-                    if let Ok(mut map) = shared_for_inflight.inflight.lock() {
-                        if let Some(tx) = map.remove(key) {
-                            let _ = tx.send(());
-                        }
+                    if let Some((_, tx)) = shared_for_inflight.inflight.remove(key) {
+                        let _ = tx.send(());
                     }
                 }
 
@@ -908,10 +920,8 @@ async fn handle(
         }
         Err(err) => {
             // 업스트림 오류 시에도 inflight 정리
-            if let Ok(mut map) = shared.inflight.lock() {
-                if let Some(tx) = map.remove(&final_cache_key) {
-                    let _ = tx.send(());
-                }
+            if let Some((_, tx)) = shared.inflight.remove(&final_cache_key) {
+                let _ = tx.send(());
             }
             stats.errors.fetch_add(1, Ordering::Relaxed);
             warn!(

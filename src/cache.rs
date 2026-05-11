@@ -1,5 +1,7 @@
 use anyhow::Result;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -53,12 +55,26 @@ pub struct CacheStoreOptions {
 pub struct DiskCache {
     root: PathBuf,
     max_size: u64,
-    inner: Arc<Mutex<()>>, // simple global lock for size maintenance (can improve with sharded locks)
+    inner: Arc<Mutex<CacheInner>>,
     default_ttl: Duration,
-    // 정책: 구성 단계에서 선택
     policy: crate::config::EvictionPolicy,
-    touch_tx: mpsc::Sender<PathBuf>, // 비동기 last_access_at 갱신 큐
-    evict_tx: mpsc::Sender<()>,      // 비동기 eviction 트리거
+    touch_tx: mpsc::Sender<PathBuf>,
+    evict_tx: mpsc::Sender<()>,
+}
+
+struct CacheInner {
+    meta_cache: LruCache<String, Meta>,
+    index: Vec<IndexEntry>,
+    total_size: u64,
+}
+
+#[derive(Clone)]
+struct IndexEntry {
+    key: String,
+    base_path: PathBuf,
+    created_at: u64,
+    size: u64,
+    last_access_at: u64,
 }
 
 impl DiskCache {
@@ -73,65 +89,147 @@ impl DiskCache {
         let (touch_tx, mut touch_rx) = mpsc::channel::<PathBuf>(1024);
         let (evict_tx, mut evict_rx) = mpsc::channel::<()>(1);
 
-        let root_clone = root.clone();
-        // 비동기 last_access_at 터치 워커
         tokio::spawn(async move {
-            while let Some(meta_path) = touch_rx.recv().await {
-                // meta 파일 읽고 last_access_at 갱신 (best-effort)
-                if let Ok(bytes) = tfs::read(&meta_path).await {
-                    if let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) {
-                        let bin_path = meta_path.with_extension("bin");
-                        if tfs::metadata(&bin_path)
-                            .await
-                            .map(|m| m.len() != meta.size)
-                            .unwrap_or(true)
-                        {
-                            continue;
+            let mut batch: Vec<PathBuf> = Vec::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    Some(meta_path) = touch_rx.recv() => {
+                        batch.push(meta_path);
+                        if batch.len() >= 100 {
+                            Self::flush_touch_batch(&mut batch).await;
                         }
-                        meta.last_access_at = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        if let Ok(new_bytes) = serde_json::to_vec(&meta) {
-                            // write back (ignore errors)
-                            if let Err(e) = Self::write_file(&meta_path, &new_bytes).await {
-                                debug!(target: "cache", error=?e, path=?meta_path, "touch write failed");
-                            }
+                    }
+                    _ = ticker.tick() => {
+                        if !batch.is_empty() {
+                            Self::flush_touch_batch(&mut batch).await;
                         }
-                    } else {
-                        // 손상된 meta → 관련 bin 제거
-                        let base = meta_path.with_extension("");
-                        let _ = tfs::remove_file(base.with_extension("bin")).await;
-                        let _ = tfs::remove_file(&meta_path).await;
-                        debug!(target: "cache", path=?meta_path, "removed corrupt meta");
                     }
                 }
             }
-            debug!(target: "cache", root=?root_clone, "touch worker stopped");
         });
 
+        let cache_capacity = NonZeroUsize::new(10000).unwrap();
         let cache = Self {
-            root,
+            root: root.clone(),
             max_size,
-            inner: Arc::new(Mutex::new(())),
+            inner: Arc::new(Mutex::new(CacheInner {
+                meta_cache: LruCache::new(cache_capacity),
+                index: Vec::new(),
+                total_size: 0,
+            })),
             default_ttl,
             policy,
             touch_tx,
             evict_tx,
         };
 
-        // 비동기 eviction 워커
         let cache_for_evict = cache.clone();
         tokio::spawn(async move {
             while evict_rx.recv().await.is_some() {
-                // 단순화: 신호 받으면 실행. (debouncing 추가 가능)
                 if let Err(e) = cache_for_evict.enforce_size_limit().await {
                     debug!(target: "cache", error=?e, "eviction failed");
                 }
             }
         });
 
+        cache.rebuild_index().await?;
+
         Ok(cache)
+    }
+
+    async fn flush_touch_batch(batch: &mut Vec<PathBuf>) {
+        for meta_path in batch.drain(..) {
+            if let Ok(bytes) = tfs::read(&meta_path).await {
+                if let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) {
+                    let bin_path = meta_path.with_extension("bin");
+                    if tfs::metadata(&bin_path)
+                        .await
+                        .map(|m| m.len() != meta.size)
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    meta.last_access_at = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    if let Ok(new_bytes) = serde_json::to_vec(&meta) {
+                        if let Err(e) = Self::write_file(&meta_path, &new_bytes).await {
+                            debug!(target: "cache", error=?e, path=?meta_path, "touch write failed");
+                        }
+                    }
+                } else {
+                    let base = meta_path.with_extension("");
+                    let _ = tfs::remove_file(base.with_extension("bin")).await;
+                    let _ = tfs::remove_file(&meta_path).await;
+                    debug!(target: "cache", path=?meta_path, "removed corrupt meta");
+                }
+            }
+        }
+    }
+
+    async fn rebuild_index(&self) -> Result<()> {
+        let mut entries = Vec::new();
+        let mut total = 0u64;
+        let mut stack = vec![self.root.clone()];
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        while let Some(dir) = stack.pop() {
+            let Ok(mut rd) = tfs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let Ok(ty) = entry.file_type().await else {
+                    continue;
+                };
+                if ty.is_dir() {
+                    stack.push(entry.path());
+                } else if entry.path().extension().and_then(|s| s.to_str()) == Some("meta") {
+                    if let Ok(meta_bytes) = tfs::read(entry.path()).await {
+                        if let Ok(meta) = serde_json::from_slice::<Meta>(&meta_bytes) {
+                            let base = entry.path().with_extension("");
+                            let bin = base.with_extension("bin");
+                            if tfs::metadata(&bin).await.is_ok() {
+                                let fully_expired = if now > meta.expires_at {
+                                    if let Some(swr_end) = meta.swr_expires_at {
+                                        now > swr_end
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !fully_expired {
+                                    let key = base.file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    entries.push(IndexEntry {
+                                        key,
+                                        base_path: base,
+                                        created_at: meta.created_at,
+                                        size: meta.size,
+                                        last_access_at: meta.last_access_at,
+                                    });
+                                    total += meta.size;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut inner = self.inner.lock().await;
+        inner.index = entries;
+        inner.total_size = total;
+        Ok(())
     }
 
     /// 현재 캐시 사용량 (bytes) 과 항목 수 반환 (best-effort, 만료 항목 포함)
@@ -140,9 +238,13 @@ impl DiskCache {
         let mut entries = 0u64;
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(mut rd) = tfs::read_dir(&dir).await else { continue };
+            let Ok(mut rd) = tfs::read_dir(&dir).await else {
+                continue;
+            };
             while let Ok(Some(entry)) = rd.next_entry().await {
-                let Ok(ty) = entry.file_type().await else { continue };
+                let Ok(ty) = entry.file_type().await else {
+                    continue;
+                };
                 if ty.is_dir() {
                     stack.push(entry.path());
                 } else if entry.path().extension().and_then(|s| s.to_str()) == Some("bin") {
@@ -226,6 +328,54 @@ impl DiskCache {
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
 
+        let mut inner = self.inner.lock().await;
+        if let Some(meta) = inner.meta_cache.get(key).cloned() {
+            drop(inner);
+
+            let data_meta = match tfs::metadata(&data_path).await {
+                Ok(m) if m.is_file() => m,
+                _ => return Ok(None),
+            };
+
+            if data_meta.len() != meta.size {
+                let _ = tfs::remove_file(&data_path).await;
+                let _ = tfs::remove_file(&meta_path).await;
+                debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
+                return Ok(None);
+            }
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let is_fresh = if now > meta.expires_at {
+                if let Some(swr_end) = meta.swr_expires_at
+                    && now <= swr_end
+                {
+                    false
+                } else {
+                    let _ = tfs::remove_file(&data_path).await;
+                    let _ = tfs::remove_file(&meta_path).await;
+                    debug!(target: "cache", key=%key, "expired entry removed");
+                    return Ok(None);
+                }
+            } else {
+                true
+            };
+
+            let _ = self.touch_tx.try_send(meta_path);
+            return Ok(Some(CacheFileEntry {
+                path: data_path,
+                size: meta.size,
+                content_type: meta.content_type,
+                is_fresh,
+                etag: meta.etag,
+                created_at: meta.created_at,
+                last_modified: meta.last_modified,
+            }));
+        }
+        drop(inner);
+
         let (data_meta, meta_bytes) =
             tokio::join!(tfs::metadata(&data_path), tfs::read(&meta_path));
         let (data_meta, meta_bytes) = match (data_meta, meta_bytes) {
@@ -269,6 +419,10 @@ impl DiskCache {
             true
         };
 
+        let mut inner = self.inner.lock().await;
+        inner.meta_cache.put(key.to_string(), meta.clone());
+        drop(inner);
+
         let _ = self.touch_tx.try_send(meta_path);
         Ok(Some(CacheFileEntry {
             path: data_path,
@@ -288,7 +442,7 @@ impl DiskCache {
         size: u64,
         options: CacheStoreOptions,
     ) -> Result<()> {
-        let _g = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
         let path = self.key_path(key);
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
@@ -329,99 +483,77 @@ impl DiskCache {
             return Err(e.into());
         }
 
+        inner.meta_cache.put(key.to_string(), meta.clone());
+        inner.index.push(IndexEntry {
+            key: key.to_string(),
+            base_path: path.clone(),
+            created_at: meta.created_at,
+            size: meta.size,
+            last_access_at: meta.last_access_at,
+        });
+        inner.total_size += size;
+        drop(inner);
+
         let _ = self.evict_tx.try_send(());
 
         Ok(())
     }
 
     async fn enforce_size_limit(&self) -> Result<()> {
-        // Intentionally not holding self.inner lock for the full scan: the walk is slow and
-        // would block put(). Racy deletions are acceptable for a cache.
-        let mut entries: Vec<(PathBuf, u64, u64, u64)> = Vec::new(); // (base_path, created_at, size, last_access_at)
-        let mut total = 0u64;
-        let mut stack = vec![self.root.clone()];
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        while let Some(dir) = stack.pop() {
-            let mut rd = tfs::read_dir(&dir).await?;
-            while let Some(entry) = rd.next_entry().await? {
-                let ty = entry.file_type().await?;
-                if ty.is_dir() {
-                    stack.push(entry.path());
-                    continue;
-                }
-                if entry.path().extension().and_then(|s| s.to_str()) == Some("meta") {
-                    let meta_bytes = tfs::read(entry.path()).await.ok();
-                    if let Some(mb) = meta_bytes
-                        && let Ok(meta) = serde_json::from_slice::<Meta>(&mb)
-                    {
-                        let base = entry.path().with_extension("");
-                        let bin = base.with_extension("bin");
-                        if tfs::metadata(&bin).await.is_ok() {
-                            // 만료( + swr 종료) 된 항목은 즉시 삭제 후 스킵
-                            let fully_expired = if now > meta.expires_at {
-                                if let Some(swr_end) = meta.swr_expires_at {
-                                    now > swr_end
-                                } else {
-                                    true
-                                }
-                            } else {
-                                false
-                            };
-                            if fully_expired {
-                                let _ = tfs::remove_file(bin).await;
-                                let _ = tfs::remove_file(entry.path()).await;
-                                continue;
-                            }
-                            total += meta.size;
-                            entries.push((base, meta.created_at, meta.size, meta.last_access_at));
-                        }
-                    }
-                }
-            }
-        }
-        if total <= self.max_size {
+        let mut inner = self.inner.lock().await;
+
+        if inner.total_size <= self.max_size {
             return Ok(());
         }
-        debug!(target: "cache", current_bytes=total, max_bytes=self.max_size, entries=entries.len(), "starting eviction");
-        // 정책별 정렬
+
+        debug!(target: "cache", current_bytes=inner.total_size, max_bytes=self.max_size, entries=inner.index.len(), "starting eviction");
+
         match self.policy {
             crate::config::EvictionPolicy::Fifo => {
-                entries.sort_by_key(|(_, created, _, _)| *created);
+                inner.index.sort_by_key(|e| e.created_at);
             }
             crate::config::EvictionPolicy::Lru => {
-                entries.sort_by_key(|(_, _created, _size, last_access)| *last_access);
+                inner.index.sort_by_key(|e| e.last_access_at);
             }
             crate::config::EvictionPolicy::Size => {
-                entries.sort_by_key(|b| std::cmp::Reverse(b.2)); // 큰 것 먼저 제거
+                inner.index.sort_by_key(|e| std::cmp::Reverse(e.size));
             }
             crate::config::EvictionPolicy::LruSize => {
-                // last_access 오래된 것 우선, 동일 last_access 내에서는 큰 size 우선 제거
-                entries.sort_by(|a, b| {
-                    let la = a.3.cmp(&b.3); // last_access_at asc
+                inner.index.sort_by(|a, b| {
+                    let la = a.last_access_at.cmp(&b.last_access_at);
                     if la == std::cmp::Ordering::Equal {
-                        b.2.cmp(&a.2)
+                        b.size.cmp(&a.size)
                     } else {
                         la
                     }
                 });
             }
         }
-        for (base, _created, size, _last_access) in entries {
+
+        let mut to_remove = Vec::new();
+        let mut total = inner.total_size;
+
+        for entry in &inner.index {
             if total <= self.max_size {
                 break;
             }
-            let _ = tfs::remove_file(base.with_extension("bin")).await;
-            let _ = tfs::remove_file(base.with_extension("meta")).await;
-            // 관련 vary index 는 유지 (다른 variant 가 존재할 수 있음)
-            if total >= size {
-                total -= size;
+            to_remove.push(entry.clone());
+            if total >= entry.size {
+                total -= entry.size;
             } else {
                 total = 0;
             }
         }
+
+        for entry in &to_remove {
+            let _ = tfs::remove_file(entry.base_path.with_extension("bin")).await;
+            let _ = tfs::remove_file(entry.base_path.with_extension("meta")).await;
+            inner.meta_cache.pop(&entry.key);
+        }
+
+        inner.index.retain(|e| !to_remove.iter().any(|r| r.key == e.key));
+        inner.total_size = total;
+
         debug!(target: "cache", final_bytes=total, "eviction complete");
         Ok(())
     }
