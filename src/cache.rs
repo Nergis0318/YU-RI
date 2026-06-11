@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs as tfs,
@@ -18,6 +18,40 @@ use tokio::{
 use tracing::debug;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn walk_cache_dir<F>(root: &Path, mut visit: F) -> Result<()>
+where
+    F: FnMut(&Path) + Send,
+{
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = tfs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let Ok(ty) = entry.file_type().await else {
+                continue;
+            };
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else {
+                files.push(entry.path());
+            }
+        }
+    }
+    for path in &files {
+        visit(path);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Meta {
@@ -152,14 +186,11 @@ impl DiskCache {
                     {
                         continue;
                     }
-                    meta.last_access_at = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    if let Ok(new_bytes) = serde_json::to_vec(&meta) {
-                        if let Err(e) = Self::write_file(&meta_path, &new_bytes).await {
-                            debug!(target: "cache", error=?e, path=?meta_path, "touch write failed");
-                        }
+                    meta.last_access_at = now_secs();
+                    if let Ok(new_bytes) = serde_json::to_vec(&meta)
+                        && let Err(e) = Self::write_file(&meta_path, &new_bytes).await
+                    {
+                        debug!(target: "cache", error=?e, path=?meta_path, "touch write failed");
                     }
                 } else {
                     let base = meta_path.with_extension("");
@@ -172,58 +203,46 @@ impl DiskCache {
     }
 
     async fn rebuild_index(&self) -> Result<()> {
+        let now = now_secs();
+        let mut meta_paths = Vec::new();
+        walk_cache_dir(&self.root, |path| {
+            if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                meta_paths.push(path.to_path_buf());
+            }
+        })
+        .await?;
+
         let mut entries = Vec::new();
         let mut total = 0u64;
-        let mut stack = vec![self.root.clone()];
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        while let Some(dir) = stack.pop() {
-            let Ok(mut rd) = tfs::read_dir(&dir).await else {
+        for meta_path in meta_paths {
+            let base = meta_path.with_extension("");
+            let Ok(bytes) = tfs::read(&meta_path).await else {
                 continue;
             };
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let Ok(ty) = entry.file_type().await else {
-                    continue;
-                };
-                if ty.is_dir() {
-                    stack.push(entry.path());
-                } else if entry.path().extension().and_then(|s| s.to_str()) == Some("meta") {
-                    if let Ok(meta_bytes) = tfs::read(entry.path()).await {
-                        if let Ok(meta) = serde_json::from_slice::<Meta>(&meta_bytes) {
-                            let base = entry.path().with_extension("");
-                            let bin = base.with_extension("bin");
-                            if tfs::metadata(&bin).await.is_ok() {
-                                let fully_expired = if now > meta.expires_at {
-                                    if let Some(swr_end) = meta.swr_expires_at {
-                                        now > swr_end
-                                    } else {
-                                        true
-                                    }
-                                } else {
-                                    false
-                                };
-                                if !fully_expired {
-                                    let key = base.file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    entries.push(IndexEntry {
-                                        key,
-                                        base_path: base,
-                                        created_at: meta.created_at,
-                                        size: meta.size,
-                                        last_access_at: meta.last_access_at,
-                                    });
-                                    total += meta.size;
-                                }
-                            }
-                        }
-                    }
-                }
+            let Ok(meta) = serde_json::from_slice::<Meta>(&bytes) else {
+                continue;
+            };
+            if tfs::metadata(base.with_extension("bin")).await.is_err() {
+                continue;
             }
+            let fully_expired = now > meta.expires_at
+                && meta.swr_expires_at.is_none_or(|swr_end| now > swr_end);
+            if fully_expired {
+                continue;
+            }
+            let key = base
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            total += meta.size;
+            entries.push(IndexEntry {
+                key,
+                base_path: base,
+                created_at: meta.created_at,
+                size: meta.size,
+                last_access_at: meta.last_access_at,
+            });
         }
 
         let mut inner = self.inner.lock().await;
@@ -236,42 +255,25 @@ impl DiskCache {
     pub async fn size_info(&self) -> (u64, u64) {
         let mut total_bytes = 0u64;
         let mut entries = 0u64;
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(mut rd) = tfs::read_dir(&dir).await else {
-                continue;
-            };
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let Ok(ty) = entry.file_type().await else {
-                    continue;
-                };
-                if ty.is_dir() {
-                    stack.push(entry.path());
-                } else if entry.path().extension().and_then(|s| s.to_str()) == Some("bin") {
-                    if let Ok(m) = tfs::metadata(entry.path()).await {
-                        total_bytes += m.len();
-                        entries += 1;
-                    }
-                }
+        let _ = walk_cache_dir(&self.root, |path| {
+            if path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                total_bytes += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                entries += 1;
             }
-        }
+        })
+        .await;
         (total_bytes, entries)
     }
 
     /// 전체 캐시 비우기 (디렉토리 내 .bin / .meta / .vary 파일 삭제)
     pub async fn clear_all(&self) -> Result<()> {
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            let mut rd = tfs::read_dir(&dir).await?;
-            while let Some(entry) = rd.next_entry().await? {
-                let ty = entry.file_type().await?;
-                if ty.is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    // 확장자 제한 없이 모두 제거 (캐시 용도로만 사용되는 디렉토리라 가정)
-                    let _ = tfs::remove_file(entry.path()).await;
-                }
-            }
+        let mut paths = Vec::new();
+        walk_cache_dir(&self.root, |path| {
+            paths.push(path.to_path_buf());
+        })
+        .await?;
+        for path in paths {
+            let _ = tfs::remove_file(&path).await;
         }
         Ok(())
     }
@@ -323,63 +325,74 @@ impl DiskCache {
         Ok(path)
     }
 
+    /// Validate (size match, freshness) and convert Meta+data_path → CacheFileEntry.
+    /// Returns Ok(None) and cleans up files if validation fails.
+    async fn validate_and_build_entry(
+        &self,
+        key: &str,
+        meta: Meta,
+        data_path: PathBuf,
+        meta_path: PathBuf,
+    ) -> Result<Option<CacheFileEntry>> {
+        let data_meta = match tfs::metadata(&data_path).await {
+            Ok(m) if m.is_file() => m,
+            _ => return Ok(None),
+        };
+
+        if data_meta.len() != meta.size {
+            let _ = tfs::remove_file(&data_path).await;
+            let _ = tfs::remove_file(&meta_path).await;
+            debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
+            return Ok(None);
+        }
+
+        let now = now_secs();
+        let is_fresh = if now > meta.expires_at {
+            if meta.swr_expires_at.is_some_and(|swr_end| now <= swr_end) {
+                false
+            } else {
+                let _ = tfs::remove_file(&data_path).await;
+                let _ = tfs::remove_file(&meta_path).await;
+                debug!(target: "cache", key=%key, "expired entry removed");
+                return Ok(None);
+            }
+        } else {
+            true
+        };
+
+        let _ = self.touch_tx.try_send(meta_path);
+        Ok(Some(CacheFileEntry {
+            path: data_path,
+            size: meta.size,
+            content_type: meta.content_type,
+            is_fresh,
+            etag: meta.etag,
+            created_at: meta.created_at,
+            last_modified: meta.last_modified,
+        }))
+    }
+
     pub async fn get_file(&self, key: &str) -> Result<Option<CacheFileEntry>> {
         let path = self.key_path(key);
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
 
-        let mut inner = self.inner.lock().await;
-        if let Some(meta) = inner.meta_cache.get(key).cloned() {
-            drop(inner);
-
-            let data_meta = match tfs::metadata(&data_path).await {
-                Ok(m) if m.is_file() => m,
-                _ => return Ok(None),
-            };
-
-            if data_meta.len() != meta.size {
-                let _ = tfs::remove_file(&data_path).await;
-                let _ = tfs::remove_file(&meta_path).await;
-                debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
-                return Ok(None);
+        // Fast path: meta already in LRU cache
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(meta) = inner.meta_cache.get(key).cloned() {
+                drop(inner);
+                return self
+                    .validate_and_build_entry(key, meta, data_path, meta_path)
+                    .await;
             }
-
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let is_fresh = if now > meta.expires_at {
-                if let Some(swr_end) = meta.swr_expires_at
-                    && now <= swr_end
-                {
-                    false
-                } else {
-                    let _ = tfs::remove_file(&data_path).await;
-                    let _ = tfs::remove_file(&meta_path).await;
-                    debug!(target: "cache", key=%key, "expired entry removed");
-                    return Ok(None);
-                }
-            } else {
-                true
-            };
-
-            let _ = self.touch_tx.try_send(meta_path);
-            return Ok(Some(CacheFileEntry {
-                path: data_path,
-                size: meta.size,
-                content_type: meta.content_type,
-                is_fresh,
-                etag: meta.etag,
-                created_at: meta.created_at,
-                last_modified: meta.last_modified,
-            }));
         }
-        drop(inner);
 
+        // Slow path: read from disk
         let (data_meta, meta_bytes) =
             tokio::join!(tfs::metadata(&data_path), tfs::read(&meta_path));
-        let (data_meta, meta_bytes) = match (data_meta, meta_bytes) {
-            (Ok(data_meta), Ok(meta_bytes)) if data_meta.is_file() => (data_meta, meta_bytes),
+        let meta_bytes = match (data_meta, meta_bytes) {
+            (Ok(m), Ok(bytes)) if m.is_file() => bytes,
             _ => return Ok(None),
         };
 
@@ -393,46 +406,15 @@ impl DiskCache {
             }
         };
 
-        if data_meta.len() != meta.size {
-            let _ = tfs::remove_file(&data_path).await;
-            let _ = tfs::remove_file(&meta_path).await;
-            debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
-            return Ok(None);
+        let result = self
+            .validate_and_build_entry(key, meta.clone(), data_path, meta_path)
+            .await;
+
+        if matches!(&result, Ok(Some(_))) {
+            let mut inner = self.inner.lock().await;
+            inner.meta_cache.put(key.to_string(), meta);
         }
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let is_fresh = if now > meta.expires_at {
-            if let Some(swr_end) = meta.swr_expires_at
-                && now <= swr_end
-            {
-                false
-            } else {
-                let _ = tfs::remove_file(&data_path).await;
-                let _ = tfs::remove_file(&meta_path).await;
-                debug!(target: "cache", key=%key, "expired entry removed");
-                return Ok(None);
-            }
-        } else {
-            true
-        };
-
-        let mut inner = self.inner.lock().await;
-        inner.meta_cache.put(key.to_string(), meta.clone());
-        drop(inner);
-
-        let _ = self.touch_tx.try_send(meta_path);
-        Ok(Some(CacheFileEntry {
-            path: data_path,
-            size: meta.size,
-            content_type: meta.content_type,
-            is_fresh,
-            etag: meta.etag,
-            created_at: meta.created_at,
-            last_modified: meta.last_modified,
-        }))
+        result
     }
 
     pub async fn put_file(
@@ -450,10 +432,7 @@ impl DiskCache {
             tfs::create_dir_all(parent).await?;
         }
 
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_secs();
         let ttl_dur = options.ttl.unwrap_or(self.default_ttl);
         let meta = Meta {
             expires_at: now + ttl_dur.as_secs(),
@@ -551,7 +530,9 @@ impl DiskCache {
             inner.meta_cache.pop(&entry.key);
         }
 
-        inner.index.retain(|e| !to_remove.iter().any(|r| r.key == e.key));
+        inner
+            .index
+            .retain(|e| !to_remove.iter().any(|r| r.key == e.key));
         inner.total_size = total;
 
         debug!(target: "cache", final_bytes=total, "eviction complete");
