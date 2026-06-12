@@ -35,7 +35,10 @@ pub fn simple(code: StatusCode, msg: &str) -> Response<BoxedBody> {
     r
 }
 
-pub fn not_modified_response(entry: &CacheFileEntry, cache_status: CacheStatus) -> Response<BoxedBody> {
+pub fn not_modified_response(
+    entry: &CacheFileEntry,
+    cache_status: CacheStatus,
+) -> Response<BoxedBody> {
     let mut resp = Response::new(empty());
     *resp.status_mut() = StatusCode::NOT_MODIFIED;
     copy_entry_headers(resp.headers_mut(), entry);
@@ -142,7 +145,10 @@ fn resolve_range(total_len: u64, range: Option<(u64, Option<u64>)>) -> ResolvedR
 
 fn range_extra_headers(range: &ResolvedRange) -> Vec<(header::HeaderName, header::HeaderValue)> {
     let mut extra = Vec::with_capacity(2);
-    extra.push((header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes")));
+    extra.push((
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    ));
     if let Some(cr) = &range.content_range
         && let Ok(hv) = header::HeaderValue::from_str(cr)
     {

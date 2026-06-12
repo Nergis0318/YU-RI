@@ -19,7 +19,7 @@ pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<B
 pub const USER_AGENT: &str = concat!(
     "YU-RI/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/DevNergis/YU-RI)"
+    " (https://github.com/Xeon-Dot/YU-RI)"
 );
 
 pub fn max_cacheable_body_bytes(config: &Config) -> usize {
@@ -34,10 +34,10 @@ pub fn build_upstream_request(
     url: &str,
     range_header: Option<&header::HeaderValue>,
 ) -> Request<Full<Bytes>> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(url)
-        .header(header::USER_AGENT, header::HeaderValue::from_static(USER_AGENT));
+    let mut builder = Request::builder().method(method).uri(url).header(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(USER_AGENT),
+    );
     if let Some(range) = range_header {
         builder = builder.header(header::RANGE, range.clone());
     }
@@ -126,7 +126,10 @@ impl BodyCacheWriter {
                 let _ = tfs::remove_file(path).await;
             } else {
                 drop(file);
-                if let Err(e) = cache.put_file(key, &path, self.bytes_written, options).await {
+                if let Err(e) = cache
+                    .put_file(key, &path, self.bytes_written, options)
+                    .await
+                {
                     warn!(error=?e, "cache file promote failed");
                     let _ = tfs::remove_file(path).await;
                 }

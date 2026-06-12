@@ -225,8 +225,8 @@ impl DiskCache {
             if tfs::metadata(base.with_extension("bin")).await.is_err() {
                 continue;
             }
-            let fully_expired = now > meta.expires_at
-                && meta.swr_expires_at.is_none_or(|swr_end| now > swr_end);
+            let fully_expired =
+                now > meta.expires_at && meta.swr_expires_at.is_none_or(|swr_end| now > swr_end);
             if fully_expired {
                 continue;
             }

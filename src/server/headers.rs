@@ -19,7 +19,10 @@ impl CacheStatus {
 }
 
 pub fn add_cache_headers(headers: &mut HeaderMap, status: CacheStatus, created_at: u64) {
-    headers.insert("X-YU-RI-Cache", header::HeaderValue::from_static(status.as_str()));
+    headers.insert(
+        "X-YU-RI-Cache",
+        header::HeaderValue::from_static(status.as_str()),
+    );
     if let Ok(hv) = header::HeaderValue::from_str(&created_at.to_string()) {
         headers.insert("X-YU-RI-Time", hv);
     }
@@ -70,7 +73,10 @@ pub fn extract_upstream_meta(headers: &HeaderMap) -> UpstreamMeta {
 }
 
 pub fn copy_upstream_headers(dst: &mut HeaderMap, src: &HeaderMap, include_vary: bool) {
-    dst.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+    dst.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
     for hdr in [
         header::CONTENT_TYPE,
         header::CONTENT_LENGTH,
@@ -82,9 +88,7 @@ pub fn copy_upstream_headers(dst: &mut HeaderMap, src: &HeaderMap, include_vary:
             dst.insert(hdr, v.clone());
         }
     }
-    if include_vary
-        && let Some(v) = src.get(header::VARY)
-    {
+    if include_vary && let Some(v) = src.get(header::VARY) {
         dst.insert(header::VARY, v.clone());
     }
 }

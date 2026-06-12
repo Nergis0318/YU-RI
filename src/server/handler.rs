@@ -10,6 +10,8 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+use super::CacheStats;
+use super::SharedState;
 use super::headers::{
     CacheStatus, add_cache_headers, apply_vary_from_response, copy_upstream_headers,
     extract_upstream_meta, vary_cache_key,
@@ -19,8 +21,6 @@ use super::response::{
     simple,
 };
 use super::upstream::{build_upstream_request, max_cacheable_body_bytes};
-use super::CacheStats;
-use super::SharedState;
 
 pub async fn handle(
     req: Request<Incoming>,
@@ -58,11 +58,12 @@ pub async fn handle(
     let base_cache_key = upstream_url.clone();
     let range_request = parse_range_header(req.headers());
 
-    let final_cache_key = if let Ok(Some(vary_names)) = cache.get_vary_header_names(&base_cache_key).await {
-        vary_cache_key(&base_cache_key, req.headers(), &vary_names)
-    } else {
-        base_cache_key.clone()
-    };
+    let final_cache_key =
+        if let Ok(Some(vary_names)) = cache.get_vary_header_names(&base_cache_key).await {
+            vary_cache_key(&base_cache_key, req.headers(), &vary_names)
+        } else {
+            base_cache_key.clone()
+        };
     let if_none_match = req
         .headers()
         .get(header::IF_NONE_MATCH)
@@ -83,7 +84,14 @@ pub async fn handle(
             };
             stats.record_hit(entry.is_fresh);
             stats.not_modified.fetch_add(1, Ordering::Relaxed);
-            log_request(&method, &path, 304, cache_status.as_str(), false, start_time);
+            log_request(
+                &method,
+                &path,
+                304,
+                cache_status.as_str(),
+                false,
+                start_time,
+            );
             if !entry.is_fresh {
                 let s = shared.clone();
                 tokio::spawn(async move {
@@ -133,7 +141,8 @@ pub async fn handle(
 
     stats.misses.fetch_add(1, Ordering::Relaxed);
 
-    if !is_head && range_request.is_none()
+    if !is_head
+        && range_request.is_none()
         && let Some(resp) = try_coalesced_hit(
             &shared,
             &final_cache_key,
@@ -203,8 +212,7 @@ fn is_not_modified(
 ) -> bool {
     let etag_matches = match (if_none_match, &entry.etag) {
         (Some(req_etag), Some(entry_etag)) => {
-            req_etag.trim().trim_start_matches("W/")
-                == entry_etag.trim().trim_start_matches("W/")
+            req_etag.trim().trim_start_matches("W/") == entry_etag.trim().trim_start_matches("W/")
         }
         _ => false,
     };
@@ -243,7 +251,14 @@ async fn try_coalesced_hit(
     let entry = shared.cache.get_file(final_cache_key).await.ok()??;
     stats.hits.fetch_add(1, Ordering::Relaxed);
     let resp = build_cached_response(&entry, range_request, CacheStatus::Hit, false);
-    log_request(method, path, resp.status().as_u16(), "HIT", true, start_time);
+    log_request(
+        method,
+        path,
+        resp.status().as_u16(),
+        "HIT",
+        true,
+        start_time,
+    );
     Some(resp)
 }
 
@@ -315,7 +330,14 @@ async fn fetch_from_upstream(
                 *resp.status_mut() = status;
                 add_cache_headers(resp.headers_mut(), CacheStatus::Miss, 0);
                 copy_upstream_headers(resp.headers_mut(), &headers, false);
-                log_request(method, path, resp.status().as_u16(), "MISS", false, start_time);
+                log_request(
+                    method,
+                    path,
+                    resp.status().as_u16(),
+                    "MISS",
+                    false,
+                    start_time,
+                );
                 return Ok(resp);
             }
 
