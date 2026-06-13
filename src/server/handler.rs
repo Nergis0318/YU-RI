@@ -6,7 +6,7 @@ use http::{Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -20,7 +20,7 @@ use super::response::{
     BoxedBody, build_cached_response, empty, full, not_modified_response, parse_range_header,
     simple,
 };
-use super::upstream::{build_upstream_request, max_cacheable_body_bytes};
+use super::upstream::{background_refresh, build_upstream_request, max_cacheable_body_bytes};
 
 pub async fn handle(
     req: Request<Incoming>,
@@ -29,6 +29,17 @@ pub async fn handle(
     let start_time = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    handle_request(req, shared, method, path, start_time).await
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    shared: SharedState,
+    method: http::Method,
+    path: String,
+    start_time: Instant,
+) -> Result<Response<BoxedBody>, hyper::Error> {
     let (config, cache, stats) = (&shared.config, &shared.cache, &shared.stats);
 
     if let Some(resp) = try_admin_endpoint(path.as_str(), cache, stats, config).await {
@@ -64,6 +75,7 @@ pub async fn handle(
         } else {
             base_cache_key.clone()
         };
+
     let if_none_match = req
         .headers()
         .get(header::IF_NONE_MATCH)
@@ -76,66 +88,20 @@ pub async fn handle(
         .and_then(|s| httpdate::parse_http_date(s).ok());
 
     if let Ok(Some(entry)) = cache.get_file(&final_cache_key).await {
-        if is_not_modified(&entry, &if_none_match, if_modified_since) {
-            let cache_status = if entry.is_fresh {
-                CacheStatus::Hit
-            } else {
-                CacheStatus::Stale
-            };
-            stats.record_hit(entry.is_fresh);
-            stats.not_modified.fetch_add(1, Ordering::Relaxed);
-            log_request(
-                &method,
-                &path,
-                304,
-                cache_status.as_str(),
-                false,
-                start_time,
-            );
-            if !entry.is_fresh {
-                let s = shared.clone();
-                tokio::spawn(async move {
-                    let _ = super::upstream::background_refresh(
-                        final_cache_key,
-                        base_cache_key,
-                        &s.config,
-                        &s.cache,
-                        &s.client,
-                    )
-                    .await;
-                });
-            }
-            return Ok(not_modified_response(&entry, cache_status));
-        }
-
-        let cache_status = if entry.is_fresh {
-            CacheStatus::Hit
-        } else {
-            CacheStatus::Stale
-        };
-        stats.record_hit(entry.is_fresh);
-        let resp = build_cached_response(&entry, range_request, cache_status, is_head);
-        if !entry.is_fresh {
-            let s = shared.clone();
-            tokio::spawn(async move {
-                let _ = super::upstream::background_refresh(
-                    final_cache_key,
-                    base_cache_key,
-                    &s.config,
-                    &s.cache,
-                    &s.client,
-                )
-                .await;
-            });
-        }
-        log_request(
+        let resp = serve_cache_hit(
+            &shared,
+            entry,
+            &final_cache_key,
+            &base_cache_key,
+            &if_none_match,
+            if_modified_since,
+            range_request,
+            is_head,
             &method,
             &path,
-            resp.status().as_u16(),
-            cache_status.as_str(),
-            false,
             start_time,
-        );
+        )
+        .await;
         return Ok(resp);
     }
 
@@ -170,6 +136,58 @@ pub async fn handle(
         start_time,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_cache_hit(
+    shared: &SharedState,
+    entry: crate::cache::CacheFileEntry,
+    final_cache_key: &str,
+    base_cache_key: &str,
+    if_none_match: &Option<String>,
+    if_modified_since: Option<SystemTime>,
+    range_request: Option<(u64, Option<u64>)>,
+    is_head: bool,
+    method: &http::Method,
+    path: &str,
+    start_time: Instant,
+) -> Response<BoxedBody> {
+    let stats = &shared.stats;
+
+    if is_not_modified(&entry, if_none_match, if_modified_since) {
+        let cache_status = if entry.is_fresh {
+            CacheStatus::Hit
+        } else {
+            CacheStatus::Stale
+        };
+        stats.record_hit(entry.is_fresh);
+        stats.not_modified.fetch_add(1, Ordering::Relaxed);
+        log_request(method, path, 304, cache_status.as_str(), false, start_time);
+        if !entry.is_fresh {
+            trigger_background_refresh(shared, final_cache_key.to_string(), base_cache_key.to_string());
+        }
+        return not_modified_response(&entry, cache_status);
+    }
+
+    let cache_status = if entry.is_fresh {
+        CacheStatus::Hit
+    } else {
+        CacheStatus::Stale
+    };
+    stats.record_hit(entry.is_fresh);
+    let resp = build_cached_response(&entry, range_request, cache_status, is_head);
+    if !entry.is_fresh {
+        trigger_background_refresh(shared, final_cache_key.to_string(), base_cache_key.to_string());
+    }
+    log_request(
+        method,
+        path,
+        resp.status().as_u16(),
+        cache_status.as_str(),
+        false,
+        start_time,
+    );
+    resp
 }
 
 async fn try_admin_endpoint(
@@ -208,16 +226,10 @@ async fn try_admin_endpoint(
 fn is_not_modified(
     entry: &crate::cache::CacheFileEntry,
     if_none_match: &Option<String>,
-    if_modified_since: Option<std::time::SystemTime>,
+    if_modified_since: Option<SystemTime>,
 ) -> bool {
-    let etag_matches = match (if_none_match, &entry.etag) {
-        (Some(req_etag), Some(entry_etag)) => {
-            req_etag.trim().trim_start_matches("W/") == entry_etag.trim().trim_start_matches("W/")
-        }
-        _ => false,
-    };
-    if etag_matches {
-        return true;
+    if let Some(req_inm) = if_none_match {
+        return etag_precondition_matches(req_inm, &entry.etag);
     }
     match (if_modified_since, &entry.last_modified) {
         (Some(ims), Some(lm_str)) => httpdate::parse_http_date(lm_str)
@@ -225,6 +237,62 @@ fn is_not_modified(
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn etag_precondition_matches(req_inm: &str, entry_etag: &Option<String>) -> bool {
+    let req_inm = req_inm.trim();
+    if req_inm == "*" {
+        return true;
+    }
+    let entry_etag = match entry_etag {
+        Some(e) => e,
+        None => return false,
+    };
+    let (_, entry_tag) = parse_entity_tag(entry_etag);
+    for raw in req_inm.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (_, req_tag) = parse_entity_tag(raw);
+        if req_tag == entry_tag {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_entity_tag(tag: &str) -> (bool, &str) {
+    let tag = tag.trim();
+    let (weak, rest) = if let Some(r) = tag.strip_prefix("W/") {
+        (true, r)
+    } else {
+        (false, tag)
+    };
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(rest);
+    (weak, rest)
+}
+
+fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_url: String) {
+    if shared.refresh_inflight.insert(cache_key.clone(), ()).is_some() {
+        return;
+    }
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let _ = background_refresh(
+            cache_key.clone(),
+            upstream_url,
+            &s.config,
+            &s.cache,
+            &s.client,
+        )
+        .await;
+        s.refresh_inflight.remove(&cache_key);
+    });
 }
 
 async fn try_coalesced_hit(
@@ -262,6 +330,7 @@ async fn try_coalesced_hit(
     Some(resp)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_from_upstream(
     req: Request<Incoming>,
     shared: SharedState,

@@ -51,7 +51,7 @@ struct TomlUpstreamSub {
 
 #[derive(Debug, Clone)]
 pub struct UpstreamSub {
-    /// Base URL for this sub-route (e.g. "https://example.com/asdadsad")
+    /// Base URL for this sub-route (e.g. "https://example.com/static")
     pub url: String,
     /// Path prefix to match (e.g. "/path/to/subpath")
     pub path: String,
@@ -75,13 +75,13 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy)]
 pub enum EvictionPolicy {
-    /// First-In-First-Out (created_at 기반)
+    /// First-In-First-Out (based on created_at)
     Fifo,
-    /// Least Recently Used (last_access_at 오래된 것 먼저)
+    /// Least Recently Used (oldest last_access_at first)
     Lru,
-    /// Size 우선 (가장 큰 객체부터 제거)
+    /// Evict largest objects first
     Size,
-    /// LRU 우선, 동일/유사 접근시 큰 객체 우선 제거
+    /// LRU primary, tie-break by larger size
     LruSize,
 }
 
@@ -91,7 +91,7 @@ impl EvictionPolicy {
             "FIFO" => Self::Fifo,
             "SIZE" => Self::Size,
             "LRU_SIZE" | "LRUSIZE" | "LRU-SIZE" => Self::LruSize,
-            _ => Self::Lru, // 기본 LRU
+            _ => Self::Lru, // default LRU
         }
     }
 }
@@ -165,7 +165,7 @@ impl Config {
             .unwrap_or_default()
             .into_iter()
             .map(|s| {
-                // 경로는 항상 '/' 로 시작하도록 정규화, 끝의 '/' 는 제거
+                // Normalize paths to start with '/' and strip trailing '/'
                 let path = if s.path.starts_with('/') {
                     s.path.trim_end_matches('/').to_string()
                 } else {
@@ -175,7 +175,7 @@ impl Config {
             })
             .collect();
 
-        // 긴 path 부터 매칭하도록 내림차순 정렬 (greedy matching)
+        // Sort longest path first for greedy matching
         upstream_subs.sort_by_key(|b| std::cmp::Reverse(b.path.len()));
 
         Ok(Self {
@@ -202,7 +202,7 @@ impl Config {
     /// Example:
     ///   sub.path = "/assets", sub.url = "https://cdn.example.com/static"
     ///   req_path = "/assets/img/logo.png"
-    ///   → "https://cdn.example.com/static/img/logo.png"
+    ///   -> "https://cdn.example.com/static/img/logo.png"
     pub fn resolve_upstream(&self, req_path_and_query: &str) -> String {
         // req_path_and_query looks like "/some/path?query=1"
         // We only match against the path portion for sub routing.

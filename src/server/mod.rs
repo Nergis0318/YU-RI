@@ -4,6 +4,7 @@ mod response;
 mod upstream;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::cache::DiskCache;
 use crate::config::Config;
@@ -48,6 +49,7 @@ pub(crate) struct AppState {
     client: HttpClient,
     stats: Arc<CacheStats>,
     inflight: Arc<DashMap<String, broadcast::Sender<()>>>,
+    refresh_inflight: Arc<DashMap<String, ()>>,
 }
 
 pub(crate) type SharedState = Arc<AppState>;
@@ -75,6 +77,7 @@ pub async fn run(config: Config) -> Result<()> {
         client,
         stats: Arc::new(CacheStats::default()),
         inflight: Arc::new(DashMap::new()),
+        refresh_inflight: Arc::new(DashMap::new()),
     });
 
     spawn_cache_clear_tasks(&shared).await?;
@@ -84,6 +87,7 @@ pub async fn run(config: Config) -> Result<()> {
     info!(?addr, "Listening");
 
     let mut shutdown_signal = std::pin::pin!(shutdown_signal());
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -98,7 +102,7 @@ pub async fn run(config: Config) -> Result<()> {
 
                 let io = TokioIo::new(stream);
                 let shared = shared.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let service = service_fn(move |req| {
                         let shared = shared.clone();
                         async move { handle(req, shared).await }
@@ -116,6 +120,17 @@ pub async fn run(config: Config) -> Result<()> {
                 break;
             }
         }
+    }
+
+    drop(listener);
+    info!("Draining active connections...");
+    let drain_timeout = Duration::from_secs(30);
+    let drain = async {
+        while connections.join_next().await.is_some() {}
+    };
+    if tokio::time::timeout(drain_timeout, drain).await.is_err() {
+        warn!("Graceful shutdown timed out; forcing remaining connections");
+        connections.abort_all();
     }
 
     info!("Server shutdown complete");

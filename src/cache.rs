@@ -1,6 +1,7 @@
 use anyhow::Result;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
@@ -63,7 +64,7 @@ struct Meta {
     last_access_at: u64,
     pub etag: Option<String>,
     #[serde(default)]
-    pub last_modified: Option<String>, // Last-Modified 헤더값 (RFC 7232 조건부 요청용)
+    pub last_modified: Option<String>, // Last-Modified header value for RFC 7232 conditional requests
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +99,7 @@ pub struct DiskCache {
 
 struct CacheInner {
     meta_cache: LruCache<String, Meta>,
-    index: Vec<IndexEntry>,
+    index: HashMap<String, IndexEntry>,
     total_size: u64,
 }
 
@@ -151,7 +152,7 @@ impl DiskCache {
             max_size,
             inner: Arc::new(Mutex::new(CacheInner {
                 meta_cache: LruCache::new(cache_capacity),
-                index: Vec::new(),
+                index: HashMap::new(),
                 total_size: 0,
             })),
             default_ttl,
@@ -212,7 +213,7 @@ impl DiskCache {
         })
         .await?;
 
-        let mut entries = Vec::new();
+        let mut index = HashMap::new();
         let mut total = 0u64;
         for meta_path in meta_paths {
             let base = meta_path.with_extension("");
@@ -236,22 +237,25 @@ impl DiskCache {
                 .unwrap_or("")
                 .to_string();
             total += meta.size;
-            entries.push(IndexEntry {
-                key,
-                base_path: base,
-                created_at: meta.created_at,
-                size: meta.size,
-                last_access_at: meta.last_access_at,
-            });
+            index.insert(
+                key.clone(),
+                IndexEntry {
+                    key,
+                    base_path: base,
+                    created_at: meta.created_at,
+                    size: meta.size,
+                    last_access_at: meta.last_access_at,
+                },
+            );
         }
 
         let mut inner = self.inner.lock().await;
-        inner.index = entries;
+        inner.index = index;
         inner.total_size = total;
         Ok(())
     }
 
-    /// 현재 캐시 사용량 (bytes) 과 항목 수 반환 (best-effort, 만료 항목 포함)
+    /// Returns the current cache usage in bytes and the number of entries (best-effort, may include expired items).
     pub async fn size_info(&self) -> (u64, u64) {
         let mut total_bytes = 0u64;
         let mut entries = 0u64;
@@ -265,7 +269,7 @@ impl DiskCache {
         (total_bytes, entries)
     }
 
-    /// 전체 캐시 비우기 (디렉토리 내 .bin / .meta / .vary 파일 삭제)
+    /// Clears the entire cache (removes .bin / .meta / .vary files) and resets in-memory state.
     pub async fn clear_all(&self) -> Result<()> {
         let mut paths = Vec::new();
         walk_cache_dir(&self.root, |path| {
@@ -275,6 +279,11 @@ impl DiskCache {
         for path in paths {
             let _ = tfs::remove_file(&path).await;
         }
+
+        let mut inner = self.inner.lock().await;
+        inner.index.clear();
+        inner.total_size = 0;
+        inner.meta_cache.clear();
         Ok(())
     }
 
@@ -286,7 +295,7 @@ impl DiskCache {
         self.root.join(a).join(b)
     }
 
-    // Vary 인덱스 파일 경로 (.vary 확장자)
+    // Path for the Vary index file (.vary extension)
     fn vary_index_path(&self, base_key: &str) -> PathBuf {
         self.key_path(base_key).with_extension("vary")
     }
@@ -325,7 +334,7 @@ impl DiskCache {
         Ok(path)
     }
 
-    /// Validate (size match, freshness) and convert Meta+data_path → CacheFileEntry.
+    /// Validates (size match, freshness) and converts Meta+data_path into a CacheFileEntry.
     /// Returns Ok(None) and cleans up files if validation fails.
     async fn validate_and_build_entry(
         &self,
@@ -428,6 +437,19 @@ impl DiskCache {
         let path = self.key_path(key);
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
+
+        // Remove any existing entry so the index and total size do not accumulate.
+        if let Some(old) = inner.index.remove(key) {
+            inner.total_size = inner.total_size.saturating_sub(old.size);
+            inner.meta_cache.pop(key);
+            let _ = tfs::remove_file(old.base_path.with_extension("bin")).await;
+            let _ = tfs::remove_file(old.base_path.with_extension("meta")).await;
+        }
+
+        // Also remove stale target files that may exist outside the index.
+        let _ = tfs::remove_file(&data_path).await;
+        let _ = tfs::remove_file(&meta_path).await;
+
         if let Some(parent) = data_path.parent() {
             tfs::create_dir_all(parent).await?;
         }
@@ -451,7 +473,6 @@ impl DiskCache {
         meta_file.sync_all().await?;
         drop(meta_file);
 
-        let _ = tfs::remove_file(&meta_path).await;
         if let Err(e) = tfs::rename(temp_path, &data_path).await {
             let _ = tfs::remove_file(&meta_temp_path).await;
             return Err(e.into());
@@ -463,14 +484,17 @@ impl DiskCache {
         }
 
         inner.meta_cache.put(key.to_string(), meta.clone());
-        inner.index.push(IndexEntry {
-            key: key.to_string(),
-            base_path: path.clone(),
-            created_at: meta.created_at,
-            size: meta.size,
-            last_access_at: meta.last_access_at,
-        });
-        inner.total_size += size;
+        inner.index.insert(
+            key.to_string(),
+            IndexEntry {
+                key: key.to_string(),
+                base_path: path.clone(),
+                created_at: meta.created_at,
+                size: meta.size,
+                last_access_at: meta.last_access_at,
+            },
+        );
+        inner.total_size = inner.total_size.saturating_add(size);
         drop(inner);
 
         let _ = self.evict_tx.try_send(());
@@ -487,18 +511,19 @@ impl DiskCache {
 
         debug!(target: "cache", current_bytes=inner.total_size, max_bytes=self.max_size, entries=inner.index.len(), "starting eviction");
 
+        let mut candidates: Vec<IndexEntry> = inner.index.values().cloned().collect();
         match self.policy {
             crate::config::EvictionPolicy::Fifo => {
-                inner.index.sort_by_key(|e| e.created_at);
+                candidates.sort_by_key(|e| e.created_at);
             }
             crate::config::EvictionPolicy::Lru => {
-                inner.index.sort_by_key(|e| e.last_access_at);
+                candidates.sort_by_key(|e| e.last_access_at);
             }
             crate::config::EvictionPolicy::Size => {
-                inner.index.sort_by_key(|e| std::cmp::Reverse(e.size));
+                candidates.sort_by_key(|e| std::cmp::Reverse(e.size));
             }
             crate::config::EvictionPolicy::LruSize => {
-                inner.index.sort_by(|a, b| {
+                candidates.sort_by(|a, b| {
                     let la = a.last_access_at.cmp(&b.last_access_at);
                     if la == std::cmp::Ordering::Equal {
                         b.size.cmp(&a.size)
@@ -512,11 +537,11 @@ impl DiskCache {
         let mut to_remove = Vec::new();
         let mut total = inner.total_size;
 
-        for entry in &inner.index {
+        for entry in candidates {
             if total <= self.max_size {
                 break;
             }
-            to_remove.push(entry.clone());
+            to_remove.push(entry.key.clone());
             if total >= entry.size {
                 total -= entry.size;
             } else {
@@ -524,22 +549,21 @@ impl DiskCache {
             }
         }
 
-        for entry in &to_remove {
-            let _ = tfs::remove_file(entry.base_path.with_extension("bin")).await;
-            let _ = tfs::remove_file(entry.base_path.with_extension("meta")).await;
-            inner.meta_cache.pop(&entry.key);
+        for key in &to_remove {
+            if let Some(entry) = inner.index.remove(key) {
+                let _ = tfs::remove_file(entry.base_path.with_extension("bin")).await;
+                let _ = tfs::remove_file(entry.base_path.with_extension("meta")).await;
+                inner.meta_cache.pop(key);
+            }
         }
 
-        inner
-            .index
-            .retain(|e| !to_remove.iter().any(|r| r.key == e.key));
         inner.total_size = total;
 
         debug!(target: "cache", final_bytes=total, "eviction complete");
         Ok(())
     }
 
-    // base_key 에 대한 Vary 헤더 이름 목록 조회 (없으면 None)
+    // Returns the list of Vary header names for a base key, or None if absent/invalid.
     pub async fn get_vary_header_names(&self, base_key: &str) -> Result<Option<Vec<String>>> {
         let path = self.vary_index_path(base_key);
         if tfs::metadata(&path).await.is_err() {
@@ -556,7 +580,7 @@ impl DiskCache {
         Ok(Some(names))
     }
 
-    // base_key 에 대해 Vary 헤더 이름 목록 저장 (이전 값 덮어쓰기)
+    // Stores the list of Vary header names for a base key, overwriting any previous value.
     pub async fn set_vary_header_names(&self, base_key: &str, names: &[String]) -> Result<()> {
         if names.is_empty() {
             return Ok(());

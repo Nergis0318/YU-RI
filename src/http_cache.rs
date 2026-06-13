@@ -2,12 +2,12 @@ use http::HeaderMap;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
 
-/// 결과 TTL 및 캐시 여부 판단용
+/// TTL decision and cacheability result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TtlDecision {
-    pub ttl: Option<Duration>, // None 이면 저장시 default TTL 사용
+    pub ttl: Option<Duration>, // None means use the default TTL when storing
     pub cacheable: bool,
-    pub stale_while_revalidate: Option<Duration>, // stale-while-revalidate=N 지원
+    pub stale_while_revalidate: Option<Duration>, // stale-while-revalidate=N support
 }
 
 impl TtlDecision {
@@ -34,14 +34,14 @@ impl TtlDecision {
     }
 }
 
-/// Cache-Control / Expires 헤더를 파싱해 TTL 을 결정.
-/// 규칙(간단화):
-/// 1. Cache-Control 존재시 우선.
-///    - no-store | private | no-cache => 비캐시
-///    - max-age=N => N초 (0 이면 비캐시)
-///    - s-maxage=N => 공유 프록시용, 있으면 우선적으로 사용
-/// 2. Expires (HTTP-date) 가 있고 현재보다 미래면 그 차이(초) 사용. (Cache-Control max-age/s-maxage 보다 후순위)
-/// 3. 아무것도 없으면 기본 TTL 사용 (None 반환 + cacheable=true)
+/// Parses Cache-Control / Expires headers to derive a TTL.
+/// Simplified rules:
+/// 1. If Cache-Control is present, it takes precedence.
+///    - no-store | private | no-cache => non-cacheable
+///    - max-age=N => N seconds (0 means non-cacheable)
+///    - s-maxage=N => shared proxy TTL, used if present
+/// 2. If no Cache-Control max-age/s-maxage, use Expires (HTTP-date) if it is in the future.
+/// 3. Otherwise use the default TTL (cacheable with ttl=None).
 pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
     use http::header;
     if let Some(cc_val) = headers
@@ -55,7 +55,7 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
         for part in cc_val.split(',') {
             let token = part.trim().to_ascii_lowercase();
             if token == "no-store" || token == "no-cache" || token == "private" {
-                // private 은 공유 캐시 입장에서 비캐시 처리
+                // "private" is treated as non-cacheable for a shared cache.
                 debug!(target: "http_cache", directive = token, "Cache-Control directive forces non-cacheable");
                 return TtlDecision::not_cacheable();
             }
@@ -92,13 +92,11 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
             return d;
         }
     }
-    // Expires 처리 (Cache-Control max-age 없을 때만)
+    // Expires handling (only when Cache-Control max-age/s-maxage is absent)
     if let Some(exp_val) = headers.get("Expires").and_then(|v| v.to_str().ok())
         && let Ok(exp_time) = httpdate::parse_http_date(exp_val)
     {
-        // httpdate crate
         if let Ok(diff) = exp_time.duration_since(now) {
-            // 0 초면 비캐시로 간주 (혹은 default? 여기선 비캐시)
             if diff.as_secs() == 0 {
                 debug!(target: "http_cache", expires = exp_val, "Expires header is now => non-cacheable");
                 return TtlDecision::not_cacheable();
@@ -106,12 +104,11 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
             debug!(target: "http_cache", expires = exp_val, ttl_secs = diff.as_secs(), "Derived TTL from Expires header");
             return TtlDecision::with_ttl(diff);
         } else {
-            // 이미 지난날 => 비캐시
             debug!(target: "http_cache", expires = exp_val, "Expires header is in the past => non-cacheable");
             return TtlDecision::not_cacheable();
         }
     }
-    // 기본
+    // Default cacheable policy
     debug!(target: "http_cache", "No explicit TTL headers => using default cacheable policy");
     TtlDecision::default_cacheable()
 }
