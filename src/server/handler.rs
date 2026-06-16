@@ -164,7 +164,11 @@ async fn serve_cache_hit(
         stats.not_modified.fetch_add(1, Ordering::Relaxed);
         log_request(method, path, 304, cache_status.as_str(), false, start_time);
         if !entry.is_fresh {
-            trigger_background_refresh(shared, final_cache_key.to_string(), base_cache_key.to_string());
+            trigger_background_refresh(
+                shared,
+                final_cache_key.to_string(),
+                base_cache_key.to_string(),
+            );
         }
         return not_modified_response(&entry, cache_status);
     }
@@ -177,7 +181,11 @@ async fn serve_cache_hit(
     stats.record_hit(entry.is_fresh);
     let resp = build_cached_response(&entry, range_request, cache_status, is_head);
     if !entry.is_fresh {
-        trigger_background_refresh(shared, final_cache_key.to_string(), base_cache_key.to_string());
+        trigger_background_refresh(
+            shared,
+            final_cache_key.to_string(),
+            base_cache_key.to_string(),
+        );
     }
     log_request(
         method,
@@ -278,7 +286,11 @@ fn parse_entity_tag(tag: &str) -> (bool, &str) {
 }
 
 fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_url: String) {
-    if shared.refresh_inflight.insert(cache_key.clone(), ()).is_some() {
+    if shared
+        .refresh_inflight
+        .insert(cache_key.clone(), ())
+        .is_some()
+    {
         return;
     }
     let s = shared.clone();

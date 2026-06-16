@@ -125,9 +125,7 @@ pub async fn run(config: Config) -> Result<()> {
     drop(listener);
     info!("Draining active connections...");
     let drain_timeout = Duration::from_secs(30);
-    let drain = async {
-        while connections.join_next().await.is_some() {}
-    };
+    let drain = async { while connections.join_next().await.is_some() {} };
     if tokio::time::timeout(drain_timeout, drain).await.is_err() {
         warn!("Graceful shutdown timed out; forcing remaining connections");
         connections.abort_all();
