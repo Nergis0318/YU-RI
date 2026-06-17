@@ -1,5 +1,5 @@
 use crate::cache::CacheFileEntry;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use std::{io::SeekFrom, path::PathBuf};
@@ -158,25 +158,24 @@ fn range_extra_headers(range: &ResolvedRange) -> Vec<(header::HeaderName, header
 }
 
 fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxedBody {
+    const BUF_SIZE: usize = 128 * 1024;
     let (tx, body_stream) =
         tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(64);
     tokio::spawn(async move {
         let result = async {
             let mut file = tfs::File::open(&path).await?;
             file.seek(SeekFrom::Start(start)).await?;
-            let mut remaining = len;
-            let mut buf = vec![0_u8; 128 * 1024];
-            while remaining > 0 {
-                let read_len = remaining.min(buf.len() as u64) as usize;
-                let n = file.read(&mut buf[..read_len]).await?;
+            let mut reader = file.take(len);
+            let mut buf = BytesMut::with_capacity(BUF_SIZE);
+            loop {
+                buf.reserve(BUF_SIZE);
+                let n = reader.read_buf(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
-                remaining -= n as u64;
+                let chunk = buf.split().freeze();
                 if tx
-                    .send(Ok(hyper::body::Frame::data(Bytes::copy_from_slice(
-                        &buf[..n],
-                    ))))
+                    .send(Ok(hyper::body::Frame::data(chunk)))
                     .await
                     .is_err()
                 {

@@ -9,7 +9,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use std::path::PathBuf;
 use tokio::fs as tfs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::warn;
 
 use super::headers::extract_upstream_meta;
@@ -46,9 +46,11 @@ pub fn build_upstream_request(
         .expect("build upstream request")
 }
 
+const CACHE_WRITE_BUFFER: usize = 256 * 1024;
+
 pub struct BodyCacheWriter {
     temp_path: Option<PathBuf>,
-    temp_file: Option<tfs::File>,
+    temp_file: Option<BufWriter<tfs::File>>,
     bytes_written: u64,
     pub aborted: bool,
 }
@@ -68,7 +70,7 @@ impl BodyCacheWriter {
             Ok(path) => match tfs::File::create(&path).await {
                 Ok(file) => {
                     writer.temp_path = Some(path);
-                    writer.temp_file = Some(file);
+                    writer.temp_file = Some(BufWriter::with_capacity(CACHE_WRITE_BUFFER, file));
                 }
                 Err(e) => {
                     warn!(error=?e, "cache temp file create failed");
@@ -120,19 +122,26 @@ impl BodyCacheWriter {
             self.abort().await;
             return;
         }
-        if let (Some(file), Some(path)) = (self.temp_file.take(), self.temp_path.take()) {
-            if let Err(e) = file.sync_all().await {
-                warn!(error=?e, "cache temp file sync failed");
+        if let (Some(mut buf), Some(path)) = (self.temp_file.take(), self.temp_path.take()) {
+            if let Err(e) = buf.flush().await {
+                warn!(error=?e, "cache temp file flush failed");
+                drop(buf);
                 let _ = tfs::remove_file(path).await;
-            } else {
-                drop(file);
-                if let Err(e) = cache
-                    .put_file(key, &path, self.bytes_written, options)
-                    .await
-                {
-                    warn!(error=?e, "cache file promote failed");
-                    let _ = tfs::remove_file(path).await;
-                }
+                return;
+            }
+            if let Err(e) = buf.get_mut().sync_all().await {
+                warn!(error=?e, "cache temp file sync failed");
+                drop(buf);
+                let _ = tfs::remove_file(path).await;
+                return;
+            }
+            drop(buf);
+            if let Err(e) = cache
+                .put_file(key, &path, self.bytes_written, options)
+                .await
+            {
+                warn!(error=?e, "cache file promote failed");
+                let _ = tfs::remove_file(path).await;
             }
         }
     }
@@ -156,13 +165,13 @@ pub async fn relay_body_with_cache<B>(
                 if let Ok(data) = frame.into_data()
                     && !data.is_empty()
                 {
-                    writer.write_chunk(&data, max_body_limit).await;
                     if let Some(tx) = tx
-                        && tx.send(Ok(hyper::body::Frame::data(data))).await.is_err()
+                        && tx.send(Ok(hyper::body::Frame::data(data.clone()))).await.is_err()
                     {
                         writer.abort().await;
                         break;
                     }
+                    writer.write_chunk(&data, max_body_limit).await;
                 }
             }
             Err(e) => {

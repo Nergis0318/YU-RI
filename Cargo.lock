@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "yu-ri"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "blake3",

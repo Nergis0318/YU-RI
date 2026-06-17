@@ -69,7 +69,11 @@ pub async fn run(config: Config) -> Result<()> {
         .enable_http1()
         .enable_http2()
         .build();
-    let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
+    let client: HttpClient = Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(64)
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .build(https);
 
     let shared: SharedState = Arc::new(AppState {
         config,
@@ -98,6 +102,7 @@ pub async fn run(config: Config) -> Result<()> {
                         continue;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 debug!("Accepted connection from {}", remote_addr);
 
                 let io = TokioIo::new(stream);
