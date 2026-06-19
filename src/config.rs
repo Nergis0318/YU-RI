@@ -29,6 +29,20 @@ struct TomlCache {
     body_limit: Option<u64>,
 }
 
+impl Default for TomlCache {
+    fn default() -> Self {
+        Self {
+            dir: Some("cache".into()),
+            size: Some(5 * 1024 * 1024 * 1024), // 5 GB
+            ttl: Some(300),
+            policy: Some("lru".into()),
+            interval: None,
+            cron: None,
+            body_limit: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TomlCacheInterval {
     enable: Option<bool>,
@@ -112,49 +126,29 @@ impl Config {
         let log_level = raw.settings.log.unwrap_or_else(|| "info".into());
 
         // ── cache ───────────────────────────────────────────
-        let (
-            cache_dir,
-            max_cache_size_bytes,
-            default_ttl,
-            eviction_policy,
-            cache_clear_interval,
-            cache_clear_cron,
-            max_body_bytes,
-        ) = if let Some(cache) = raw.settings.cache {
-            let dir = cache.dir.unwrap_or_else(|| "cache".into());
-            let size = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
-            let ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
-            let policy =
-                EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
+        let cache = raw.settings.cache.unwrap_or_default();
 
-            let interval = cache.interval.and_then(|iv| {
-                if iv.enable.unwrap_or(false) {
-                    let secs = iv.time.unwrap_or(0);
-                    if secs > 0 {
-                        Some(Duration::from_secs(secs))
-                    } else {
-                        None
-                    }
+        let cache_dir = cache.dir.unwrap_or_else(|| "cache".into());
+        let max_cache_size_bytes = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
+        let default_ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
+        let eviction_policy =
+            EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
+
+        let cache_clear_interval = cache.interval.and_then(|iv| {
+            if iv.enable.unwrap_or(false) {
+                let secs = iv.time.unwrap_or(0);
+                if secs > 0 {
+                    Some(Duration::from_secs(secs))
                 } else {
                     None
                 }
-            });
+            } else {
+                None
+            }
+        });
 
-            let cron = cache.cron;
-            let body_limit = cache.body_limit;
-
-            (dir, size, ttl, policy, interval, cron, body_limit)
-        } else {
-            (
-                "cache".into(),
-                5 * 1024 * 1024 * 1024,
-                Duration::from_secs(300),
-                EvictionPolicy::Lru,
-                None,
-                None,
-                None,
-            )
-        };
+        let cache_clear_cron = cache.cron;
+        let max_body_bytes = cache.body_limit;
 
         // ── upstream ────────────────────────────────────────
         let upstream_base = raw.upstream.url;

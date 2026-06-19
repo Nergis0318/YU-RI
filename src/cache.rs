@@ -195,8 +195,7 @@ impl DiskCache {
                     }
                 } else {
                     let base = meta_path.with_extension("");
-                    let _ = tfs::remove_file(base.with_extension("bin")).await;
-                    let _ = tfs::remove_file(&meta_path).await;
+                    Self::remove_entry_files(&base).await;
                     debug!(target: "cache", path=?meta_path, "removed corrupt meta");
                 }
             }
@@ -312,6 +311,21 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Remove the `.bin` and `.meta` files for a given base path.
+    async fn remove_entry_files(base: &Path) {
+        let _ = tfs::remove_file(base.with_extension("bin")).await;
+        let _ = tfs::remove_file(base.with_extension("meta")).await;
+    }
+
+    /// Remove an entry from the in-memory index and delete its backing files.
+    async fn remove_index_entry_locked(&self, key: &str, inner: &mut CacheInner) {
+        if let Some(entry) = inner.index.remove(key) {
+            Self::remove_entry_files(&entry.base_path).await;
+            inner.meta_cache.pop(key);
+            inner.total_size = inner.total_size.saturating_sub(entry.size);
+        }
+    }
+
     fn temp_path_for(path: &Path) -> PathBuf {
         let id = format!(
             "{}.{}",
@@ -349,8 +363,8 @@ impl DiskCache {
         };
 
         if data_meta.len() != meta.size {
-            let _ = tfs::remove_file(&data_path).await;
-            let _ = tfs::remove_file(&meta_path).await;
+            let base = data_path.with_extension("");
+            Self::remove_entry_files(&base).await;
             debug!(target: "cache", key=%key, expected=meta.size, actual=data_meta.len(), "removed size-mismatched entry");
             return Ok(None);
         }
@@ -360,8 +374,8 @@ impl DiskCache {
             if meta.swr_expires_at.is_some_and(|swr_end| now <= swr_end) {
                 false
             } else {
-                let _ = tfs::remove_file(&data_path).await;
-                let _ = tfs::remove_file(&meta_path).await;
+                let base = data_path.with_extension("");
+                Self::remove_entry_files(&base).await;
                 debug!(target: "cache", key=%key, "expired entry removed");
                 return Ok(None);
             }
@@ -408,8 +422,8 @@ impl DiskCache {
         let meta = match serde_json::from_slice::<Meta>(&meta_bytes) {
             Ok(meta) => meta,
             Err(_) => {
-                let _ = tfs::remove_file(&data_path).await;
-                let _ = tfs::remove_file(&meta_path).await;
+                let base = data_path.with_extension("");
+                Self::remove_entry_files(&base).await;
                 debug!(target: "cache", key=%key, "removed corrupt meta");
                 return Ok(None);
             }
@@ -439,16 +453,10 @@ impl DiskCache {
         let data_path = path.with_extension("bin");
 
         // Remove any existing entry so the index and total size do not accumulate.
-        if let Some(old) = inner.index.remove(key) {
-            inner.total_size = inner.total_size.saturating_sub(old.size);
-            inner.meta_cache.pop(key);
-            let _ = tfs::remove_file(old.base_path.with_extension("bin")).await;
-            let _ = tfs::remove_file(old.base_path.with_extension("meta")).await;
-        }
+        self.remove_index_entry_locked(key, &mut inner).await;
 
         // Also remove stale target files that may exist outside the index.
-        let _ = tfs::remove_file(&data_path).await;
-        let _ = tfs::remove_file(&meta_path).await;
+        Self::remove_entry_files(&path).await;
 
         if let Some(parent) = data_path.parent() {
             tfs::create_dir_all(parent).await?;
@@ -535,31 +543,21 @@ impl DiskCache {
         }
 
         let mut to_remove = Vec::new();
-        let mut total = inner.total_size;
+        let mut projected_total = inner.total_size;
 
         for entry in candidates {
-            if total <= self.max_size {
+            if projected_total <= self.max_size {
                 break;
             }
             to_remove.push(entry.key.clone());
-            if total >= entry.size {
-                total -= entry.size;
-            } else {
-                total = 0;
-            }
+            projected_total = projected_total.saturating_sub(entry.size);
         }
 
         for key in &to_remove {
-            if let Some(entry) = inner.index.remove(key) {
-                let _ = tfs::remove_file(entry.base_path.with_extension("bin")).await;
-                let _ = tfs::remove_file(entry.base_path.with_extension("meta")).await;
-                inner.meta_cache.pop(key);
-            }
+            self.remove_index_entry_locked(key, &mut inner).await;
         }
 
-        inner.total_size = total;
-
-        debug!(target: "cache", final_bytes=total, "eviction complete");
+        debug!(target: "cache", final_bytes=inner.total_size, "eviction complete");
         Ok(())
     }
 

@@ -140,6 +140,12 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+async fn clear_cache(shared: &SharedState, label: &str) {
+    if let Err(e) = shared.cache.clear_all().await {
+        warn!(error=?e, label, "cache clear failed");
+    }
+}
+
 async fn spawn_cache_clear_tasks(shared: &SharedState) -> Result<()> {
     if let Some(cron_expr) = shared.config.cache_clear_cron.clone() {
         let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
@@ -148,9 +154,7 @@ async fn spawn_cache_clear_tasks(shared: &SharedState) -> Result<()> {
             let shared_inner = shared_clone.clone();
             Box::pin(async move {
                 info!("Running scheduled cache clear");
-                if let Err(e) = shared_inner.cache.clear_all().await {
-                    warn!(error=?e, "cache clear failed");
-                }
+                clear_cache(&shared_inner, "scheduled").await;
             })
         })?;
         scheduler.add(job).await?;
@@ -165,9 +169,7 @@ async fn spawn_cache_clear_tasks(shared: &SharedState) -> Result<()> {
             loop {
                 ticker.tick().await;
                 info!(?interval, "Interval cache clear running");
-                if let Err(e) = shared_clone.cache.clear_all().await {
-                    warn!(error=?e, "interval cache clear failed");
-                }
+                clear_cache(&shared_clone, "interval").await;
             }
         });
         info!(every_secs=%interval.as_secs(), "Cache clear interval enabled");

@@ -1,9 +1,9 @@
 use crate::cache::{CacheStoreOptions, DiskCache};
 use crate::config::Config;
-use crate::http_cache::derive_ttl;
+use crate::http_cache::{TtlDecision, derive_ttl};
 use anyhow::Result;
 use bytes::Bytes;
-use http::{Request, StatusCode, header};
+use http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -27,6 +27,20 @@ pub fn max_cacheable_body_bytes(config: &Config) -> usize {
         .max_body_bytes
         .unwrap_or(config.max_cache_size_bytes)
         .min(usize::MAX as u64) as usize
+}
+
+pub(crate) fn store_options_from_headers(
+    headers: &HeaderMap,
+    decision: &TtlDecision,
+) -> CacheStoreOptions {
+    let meta = extract_upstream_meta(headers);
+    CacheStoreOptions {
+        content_type: meta.content_type,
+        ttl: decision.ttl,
+        swr: decision.stale_while_revalidate,
+        etag: meta.etag,
+        last_modified: meta.last_modified,
+    }
 }
 
 pub fn build_upstream_request(
@@ -208,7 +222,6 @@ pub async fn background_refresh(
         return Ok(());
     }
 
-    let meta = extract_upstream_meta(&headers);
     let mut body = up_resp.into_body();
     relay_body_with_cache(
         &mut body,
@@ -217,13 +230,7 @@ pub async fn background_refresh(
         &cache_key,
         true,
         max_cacheable_body_bytes(config) as u64,
-        CacheStoreOptions {
-            content_type: meta.content_type,
-            ttl: decision.ttl,
-            swr: decision.stale_while_revalidate,
-            etag: meta.etag,
-            last_modified: meta.last_modified,
-        },
+        store_options_from_headers(&headers, &decision),
     )
     .await;
     Ok(())

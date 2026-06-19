@@ -1,4 +1,4 @@
-use crate::cache::{CacheStoreOptions, DiskCache};
+use crate::cache::DiskCache;
 use crate::config::Config;
 use crate::http_cache::{TtlDecision, derive_ttl};
 use bytes::Bytes;
@@ -14,13 +14,15 @@ use super::CacheStats;
 use super::SharedState;
 use super::headers::{
     CacheStatus, add_cache_headers, apply_vary_from_response, copy_upstream_headers,
-    extract_upstream_meta, vary_cache_key,
+    vary_cache_key,
 };
 use super::response::{
     BoxedBody, build_cached_response, empty, full, not_modified_response, parse_range_header,
     simple,
 };
-use super::upstream::{background_refresh, build_upstream_request, max_cacheable_body_bytes};
+use super::upstream::{
+    background_refresh, build_upstream_request, max_cacheable_body_bytes, store_options_from_headers,
+};
 
 pub async fn handle(
     req: Request<Incoming>,
@@ -152,34 +154,20 @@ async fn serve_cache_hit(
     path: &str,
     start_time: Instant,
 ) -> Response<BoxedBody> {
-    let stats = &shared.stats;
-
-    if is_not_modified(&entry, if_none_match, if_modified_since) {
-        let cache_status = if entry.is_fresh {
-            CacheStatus::Hit
-        } else {
-            CacheStatus::Stale
-        };
-        stats.record_hit(entry.is_fresh);
-        stats.not_modified.fetch_add(1, Ordering::Relaxed);
-        log_request(method, path, 304, cache_status.as_str(), false, start_time);
-        if !entry.is_fresh {
-            trigger_background_refresh(
-                shared,
-                final_cache_key.to_string(),
-                base_cache_key.to_string(),
-            );
-        }
-        return not_modified_response(&entry, cache_status);
-    }
-
     let cache_status = if entry.is_fresh {
         CacheStatus::Hit
     } else {
         CacheStatus::Stale
     };
-    stats.record_hit(entry.is_fresh);
-    let resp = build_cached_response(&entry, range_request, cache_status, is_head);
+    shared.stats.record_hit(entry.is_fresh);
+
+    let resp = if is_not_modified(&entry, if_none_match, if_modified_since) {
+        shared.stats.not_modified.fetch_add(1, Ordering::Relaxed);
+        not_modified_response(&entry, cache_status)
+    } else {
+        build_cached_response(&entry, range_request, cache_status, is_head)
+    };
+
     if !entry.is_fresh {
         trigger_background_refresh(
             shared,
@@ -187,6 +175,7 @@ async fn serve_cache_hit(
             base_cache_key.to_string(),
         );
     }
+
     log_request(
         method,
         path,
@@ -404,8 +393,6 @@ async fn fetch_from_upstream(
                 let _ = cache.set_vary_header_names(&base_cache_key, &names).await;
             }
 
-            let meta = extract_upstream_meta(&headers);
-
             if is_head {
                 let mut resp = Response::new(empty());
                 *resp.status_mut() = status;
@@ -444,13 +431,7 @@ async fn fetch_from_upstream(
             let cache_cloned = cache.clone();
             let mut up_body = up_resp.into_body();
             let variant_key = vary.variant_key.clone();
-            let store_options = CacheStoreOptions {
-                content_type: meta.content_type,
-                ttl: decision.ttl,
-                swr: decision.stale_while_revalidate,
-                etag: meta.etag,
-                last_modified: meta.last_modified,
-            };
+            let store_options = store_options_from_headers(&headers, &decision);
             let shared_for_inflight = shared.clone();
             let method_for_log = method.clone();
             let path_for_log = path.to_string();
