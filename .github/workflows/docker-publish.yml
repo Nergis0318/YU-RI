@@ -1,4 +1,4 @@
-name: Docker
+name: Docker Build and Push
 
 on:
   push:
@@ -65,7 +65,7 @@ jobs:
   merge-manifests:
     needs: build
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith
+    runs-on: ubuntu-slim
     permissions:
       contents: read
       packages: write
