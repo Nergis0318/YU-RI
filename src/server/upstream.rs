@@ -180,7 +180,10 @@ pub async fn relay_body_with_cache<B>(
                     && !data.is_empty()
                 {
                     if let Some(tx) = tx
-                        && tx.send(Ok(hyper::body::Frame::data(data.clone()))).await.is_err()
+                        && tx
+                            .send(Ok(hyper::body::Frame::data(data.clone())))
+                            .await
+                            .is_err()
                     {
                         writer.abort().await;
                         break;

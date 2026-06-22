@@ -65,7 +65,7 @@ jobs:
   merge-manifests:
     needs: build
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-slim
+    runs-on: blacksmith
     permissions:
       contents: read
       packages: write

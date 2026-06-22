@@ -13,15 +13,15 @@ use tracing::{info, warn};
 use super::CacheStats;
 use super::SharedState;
 use super::headers::{
-    CacheStatus, add_cache_headers, apply_vary_from_response, copy_upstream_headers,
-    vary_cache_key,
+    CacheStatus, add_cache_headers, apply_vary_from_response, copy_upstream_headers, vary_cache_key,
 };
 use super::response::{
     BoxedBody, build_cached_response, empty, full, not_modified_response, parse_range_header,
     simple,
 };
 use super::upstream::{
-    background_refresh, build_upstream_request, max_cacheable_body_bytes, store_options_from_headers,
+    background_refresh, build_upstream_request, max_cacheable_body_bytes,
+    store_options_from_headers,
 };
 
 pub async fn handle(

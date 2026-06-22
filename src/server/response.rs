@@ -174,11 +174,7 @@ fn stream_file(path: PathBuf, start: u64, len: u64) -> BoxedBody {
                     break;
                 }
                 let chunk = buf.split().freeze();
-                if tx
-                    .send(Ok(hyper::body::Frame::data(chunk)))
-                    .await
-                    .is_err()
-                {
+                if tx.send(Ok(hyper::body::Frame::data(chunk))).await.is_err() {
                     break;
                 }
             }
