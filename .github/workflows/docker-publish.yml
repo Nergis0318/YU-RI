@@ -65,7 +65,7 @@ jobs:
   merge-manifests:
     needs: build
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-slim
     permissions:
       contents: read
       packages: write
