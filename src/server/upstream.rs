@@ -16,11 +16,7 @@ use super::headers::extract_upstream_meta;
 
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
-pub const USER_AGENT: &str = concat!(
-    "YU-RI/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://github.com/Xeon-Dot/YU-RI)"
-);
+pub const USER_AGENT: &str = concat!("YU-RI/", env!("CARGO_PKG_VERSION"));
 
 pub fn max_cacheable_body_bytes(config: &Config) -> usize {
     config

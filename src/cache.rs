@@ -92,7 +92,6 @@ pub struct DiskCache {
     max_size: u64,
     inner: Arc<Mutex<CacheInner>>,
     default_ttl: Duration,
-    policy: crate::config::EvictionPolicy,
     touch_tx: mpsc::Sender<PathBuf>,
     evict_tx: mpsc::Sender<()>,
 }
@@ -107,7 +106,6 @@ struct CacheInner {
 struct IndexEntry {
     key: String,
     base_path: PathBuf,
-    created_at: u64,
     size: u64,
     last_access_at: u64,
 }
@@ -117,7 +115,6 @@ impl DiskCache {
         root: P,
         max_size: u64,
         default_ttl: Duration,
-        policy: crate::config::EvictionPolicy,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         tfs::create_dir_all(&root).await?;
@@ -156,7 +153,6 @@ impl DiskCache {
                 total_size: 0,
             })),
             default_ttl,
-            policy,
             touch_tx,
             evict_tx,
         };
@@ -241,7 +237,6 @@ impl DiskCache {
                 IndexEntry {
                     key,
                     base_path: base,
-                    created_at: meta.created_at,
                     size: meta.size,
                     last_access_at: meta.last_access_at,
                 },
@@ -254,18 +249,10 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Returns the current cache usage in bytes and the number of entries (best-effort, may include expired items).
+    /// Returns the current cache usage in bytes and the number of entries (from in-memory index).
     pub async fn size_info(&self) -> (u64, u64) {
-        let mut total_bytes = 0u64;
-        let mut entries = 0u64;
-        let _ = walk_cache_dir(&self.root, |path| {
-            if path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                total_bytes += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                entries += 1;
-            }
-        })
-        .await;
-        (total_bytes, entries)
+        let inner = self.inner.lock().await;
+        (inner.total_size, inner.index.len() as u64)
     }
 
     /// Clears the entire cache (removes .bin / .meta / .vary files) and resets in-memory state.
@@ -497,7 +484,6 @@ impl DiskCache {
             IndexEntry {
                 key: key.to_string(),
                 base_path: path.clone(),
-                created_at: meta.created_at,
                 size: meta.size,
                 last_access_at: meta.last_access_at,
             },
@@ -520,27 +506,8 @@ impl DiskCache {
         debug!(target: "cache", current_bytes=inner.total_size, max_bytes=self.max_size, entries=inner.index.len(), "starting eviction");
 
         let mut candidates: Vec<IndexEntry> = inner.index.values().cloned().collect();
-        match self.policy {
-            crate::config::EvictionPolicy::Fifo => {
-                candidates.sort_by_key(|e| e.created_at);
-            }
-            crate::config::EvictionPolicy::Lru => {
-                candidates.sort_by_key(|e| e.last_access_at);
-            }
-            crate::config::EvictionPolicy::Size => {
-                candidates.sort_by_key(|e| std::cmp::Reverse(e.size));
-            }
-            crate::config::EvictionPolicy::LruSize => {
-                candidates.sort_by(|a, b| {
-                    let la = a.last_access_at.cmp(&b.last_access_at);
-                    if la == std::cmp::Ordering::Equal {
-                        b.size.cmp(&a.size)
-                    } else {
-                        la
-                    }
-                });
-            }
-        }
+        // LRU eviction: evict entries with the oldest last_access_at first
+        candidates.sort_by_key(|e| e.last_access_at);
 
         let mut to_remove = Vec::new();
         let mut projected_total = inner.total_size;

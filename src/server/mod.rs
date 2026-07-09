@@ -3,13 +3,14 @@ mod headers;
 mod response;
 mod upstream;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cache::DiskCache;
 use crate::config::Config;
 use anyhow::Result;
-use dashmap::DashMap;
 use handler::handle;
 use hyper::service::service_fn;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -17,7 +18,6 @@ use hyper_util::client::legacy::Client;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use std::sync::Arc;
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing::{debug, info, warn};
 
@@ -47,9 +47,9 @@ pub(crate) struct AppState {
     config: Config,
     cache: DiskCache,
     client: HttpClient,
-    stats: Arc<CacheStats>,
-    inflight: Arc<DashMap<String, broadcast::Sender<()>>>,
-    refresh_inflight: Arc<DashMap<String, ()>>,
+    stats: CacheStats,
+    inflight: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
+    refresh_inflight: Arc<Mutex<HashSet<String>>>,
 }
 
 pub(crate) type SharedState = Arc<AppState>;
@@ -59,7 +59,6 @@ pub async fn run(config: Config) -> Result<()> {
         &config.cache_dir,
         config.max_cache_size_bytes,
         config.default_ttl,
-        config.eviction_policy,
     )
     .await?;
 
@@ -79,12 +78,12 @@ pub async fn run(config: Config) -> Result<()> {
         config,
         cache,
         client,
-        stats: Arc::new(CacheStats::default()),
-        inflight: Arc::new(DashMap::new()),
-        refresh_inflight: Arc::new(DashMap::new()),
+        stats: CacheStats::default(),
+        inflight: Arc::new(Mutex::new(HashMap::new())),
+        refresh_inflight: Arc::new(Mutex::new(HashSet::new())),
     });
 
-    spawn_cache_clear_tasks(&shared).await?;
+    spawn_cache_clear_tasks(&shared).await;
 
     let addr = shared.config.listen_addr.clone();
     let listener = TcpListener::bind(&addr).await?;
@@ -146,21 +145,7 @@ async fn clear_cache(shared: &SharedState, label: &str) {
     }
 }
 
-async fn spawn_cache_clear_tasks(shared: &SharedState) -> Result<()> {
-    if let Some(cron_expr) = shared.config.cache_clear_cron.clone() {
-        let scheduler = tokio_cron_scheduler::JobScheduler::new().await?;
-        let shared_clone = shared.clone();
-        let job = tokio_cron_scheduler::Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
-            let shared_inner = shared_clone.clone();
-            Box::pin(async move {
-                info!("Running scheduled cache clear");
-                clear_cache(&shared_inner, "scheduled").await;
-            })
-        })?;
-        scheduler.add(job).await?;
-        scheduler.start().await?;
-        info!(cron=%cron_expr, "Cache clear cron enabled");
-    }
+async fn spawn_cache_clear_tasks(shared: &SharedState) {
     if let Some(interval) = shared.config.cache_clear_interval {
         let shared_clone = shared.clone();
         tokio::spawn(async move {
@@ -174,7 +159,6 @@ async fn spawn_cache_clear_tasks(shared: &SharedState) -> Result<()> {
         });
         info!(every_secs=%interval.as_secs(), "Cache clear interval enabled");
     }
-    Ok(())
 }
 
 async fn shutdown_signal() {

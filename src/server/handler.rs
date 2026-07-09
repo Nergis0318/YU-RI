@@ -275,10 +275,11 @@ fn parse_entity_tag(tag: &str) -> (bool, &str) {
 }
 
 fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_url: String) {
-    if shared
+    if !shared
         .refresh_inflight
-        .insert(cache_key.clone(), ())
-        .is_some()
+        .lock()
+        .unwrap()
+        .insert(cache_key.clone())
     {
         return;
     }
@@ -292,7 +293,7 @@ fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_
             &s.client,
         )
         .await;
-        s.refresh_inflight.remove(&cache_key);
+        s.refresh_inflight.lock().unwrap().remove(&cache_key);
     });
 }
 
@@ -306,11 +307,12 @@ async fn try_coalesced_hit(
     start_time: Instant,
 ) -> Option<Response<BoxedBody>> {
     let mut rx = {
-        if let Some(tx) = shared.inflight.get(final_cache_key) {
+        let mut map = shared.inflight.lock().unwrap();
+        if let Some(tx) = map.get(final_cache_key) {
             Some(tx.subscribe())
         } else {
             let (tx, _) = broadcast::channel::<()>(1);
-            shared.inflight.insert(final_cache_key.to_string(), tx);
+            map.insert(final_cache_key.to_string(), tx);
             None
         }
     };
@@ -449,7 +451,7 @@ async fn fetch_from_upstream(
                 .await;
                 drop(tx);
                 if let Some(ref key) = inflight_key
-                    && let Some((_, done_tx)) = shared_for_inflight.inflight.remove(key)
+                    && let Some(done_tx) = shared_for_inflight.inflight.lock().unwrap().remove(key)
                 {
                     let _ = done_tx.send(());
                 }
@@ -466,7 +468,7 @@ async fn fetch_from_upstream(
             Ok(resp)
         }
         Err(err) => {
-            if let Some((_, tx)) = shared.inflight.remove(&final_cache_key) {
+            if let Some(tx) = shared.inflight.lock().unwrap().remove(&final_cache_key) {
                 let _ = tx.send(());
             }
             stats.errors.fetch_add(1, Ordering::Relaxed);

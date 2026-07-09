@@ -19,6 +19,7 @@ struct TomlSettings {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TomlCache {
     dir: Option<String>,
     size: Option<u64>,
@@ -81,33 +82,8 @@ pub struct Config {
     pub cache_dir: String,
     pub max_cache_size_bytes: u64,
     pub default_ttl: Duration,
-    pub eviction_policy: EvictionPolicy,
-    pub cache_clear_cron: Option<String>,
     pub cache_clear_interval: Option<Duration>,
     pub max_body_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum EvictionPolicy {
-    /// First-In-First-Out (based on created_at)
-    Fifo,
-    /// Least Recently Used (oldest last_access_at first)
-    Lru,
-    /// Evict largest objects first
-    Size,
-    /// LRU primary, tie-break by larger size
-    LruSize,
-}
-
-impl EvictionPolicy {
-    pub fn from_str_loose(s: &str) -> Self {
-        match s.to_ascii_uppercase().as_str() {
-            "FIFO" => Self::Fifo,
-            "SIZE" => Self::Size,
-            "LRU_SIZE" | "LRUSIZE" | "LRU-SIZE" => Self::LruSize,
-            _ => Self::Lru, // default LRU
-        }
-    }
 }
 
 impl Config {
@@ -131,8 +107,6 @@ impl Config {
         let cache_dir = cache.dir.unwrap_or_else(|| "cache".into());
         let max_cache_size_bytes = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
         let default_ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
-        let eviction_policy =
-            EvictionPolicy::from_str_loose(&cache.policy.unwrap_or_else(|| "lru".into()));
 
         let cache_clear_interval = cache.interval.and_then(|iv| {
             if iv.enable.unwrap_or(false) {
@@ -147,7 +121,6 @@ impl Config {
             }
         });
 
-        let cache_clear_cron = cache.cron;
         let max_body_bytes = cache.body_limit;
 
         // ── upstream ────────────────────────────────────────
@@ -180,8 +153,6 @@ impl Config {
             cache_dir,
             max_cache_size_bytes,
             default_ttl,
-            eviction_policy,
-            cache_clear_cron,
             cache_clear_interval,
             max_body_bytes,
         })
@@ -259,8 +230,6 @@ mod tests {
             cache_dir: "cache".into(),
             max_cache_size_bytes: 1_000_000,
             default_ttl: Duration::from_secs(300),
-            eviction_policy: EvictionPolicy::Lru,
-            cache_clear_cron: None,
             cache_clear_interval: None,
             max_body_bytes: None,
         }
