@@ -69,6 +69,8 @@ pub async fn run(config: Config) -> Result<()> {
         .enable_http2()
         .build();
     let client: HttpClient = Client::builder(TokioExecutor::new())
+        .pool_timer(TokioTimer::new())
+        .timer(TokioTimer::new())
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(64)
         .http2_keep_alive_interval(Some(Duration::from_secs(30)))
