@@ -16,7 +16,7 @@ use hyper::service::service_fn;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing::{debug, info, warn};
@@ -111,8 +111,10 @@ pub async fn run(config: Config) -> Result<()> {
                         let shared = shared.clone();
                         async move { handle(req, shared).await }
                     });
-                    if let Err(err) = Builder::new(TokioExecutor::new())
-                        .serve_connection(io, service)
+                    let mut builder = Builder::new(TokioExecutor::new());
+                    builder.http1().timer(TokioTimer::new());
+                    builder.http2().timer(TokioTimer::new());
+                    if let Err(err) = builder.serve_connection(io, service)
                         .await
                     {
                         debug!("Error serving connection: {:?}", err);
