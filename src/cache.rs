@@ -1,8 +1,6 @@
 use anyhow::Result;
-use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -97,17 +95,14 @@ pub struct DiskCache {
 }
 
 struct CacheInner {
-    meta_cache: LruCache<String, Meta>,
     index: HashMap<String, IndexEntry>,
     total_size: u64,
 }
 
 #[derive(Clone)]
 struct IndexEntry {
-    key: String,
     base_path: PathBuf,
-    size: u64,
-    last_access_at: u64,
+    meta: Meta,
 }
 
 impl DiskCache {
@@ -143,12 +138,10 @@ impl DiskCache {
             }
         });
 
-        let cache_capacity = NonZeroUsize::new(10000).unwrap();
         let cache = Self {
             root: root.clone(),
             max_size,
             inner: Arc::new(Mutex::new(CacheInner {
-                meta_cache: LruCache::new(cache_capacity),
                 index: HashMap::new(),
                 total_size: 0,
             })),
@@ -232,15 +225,7 @@ impl DiskCache {
                 .unwrap_or("")
                 .to_string();
             total += meta.size;
-            index.insert(
-                key.clone(),
-                IndexEntry {
-                    key,
-                    base_path: base,
-                    size: meta.size,
-                    last_access_at: meta.last_access_at,
-                },
-            );
+            index.insert(key, IndexEntry { base_path: base, meta });
         }
 
         let mut inner = self.inner.lock().await;
@@ -269,7 +254,6 @@ impl DiskCache {
         let mut inner = self.inner.lock().await;
         inner.index.clear();
         inner.total_size = 0;
-        inner.meta_cache.clear();
         Ok(())
     }
 
@@ -308,8 +292,7 @@ impl DiskCache {
     async fn remove_index_entry_locked(&self, key: &str, inner: &mut CacheInner) {
         if let Some(entry) = inner.index.remove(key) {
             Self::remove_entry_files(&entry.base_path).await;
-            inner.meta_cache.pop(key);
-            inner.total_size = inner.total_size.saturating_sub(entry.size);
+            inner.total_size = inner.total_size.saturating_sub(entry.meta.size);
         }
     }
 
@@ -387,10 +370,10 @@ impl DiskCache {
         let meta_path = path.with_extension("meta");
         let data_path = path.with_extension("bin");
 
-        // Fast path: meta already in LRU cache
+        // Fast path: meta already in in-memory index
         {
-            let mut inner = self.inner.lock().await;
-            if let Some(meta) = inner.meta_cache.get(key).cloned() {
+            let inner = self.inner.lock().await;
+            if let Some(meta) = inner.index.get(key).map(|e| e.meta.clone()) {
                 drop(inner);
                 return self
                     .validate_and_build_entry(key, meta, data_path, meta_path)
@@ -416,15 +399,8 @@ impl DiskCache {
             }
         };
 
-        let result = self
-            .validate_and_build_entry(key, meta.clone(), data_path, meta_path)
-            .await;
-
-        if matches!(&result, Ok(Some(_))) {
-            let mut inner = self.inner.lock().await;
-            inner.meta_cache.put(key.to_string(), meta);
-        }
-        result
+        self.validate_and_build_entry(key, meta, data_path, meta_path)
+            .await
     }
 
     pub async fn put_file(
@@ -478,16 +454,9 @@ impl DiskCache {
             return Err(e.into());
         }
 
-        inner.meta_cache.put(key.to_string(), meta.clone());
-        inner.index.insert(
-            key.to_string(),
-            IndexEntry {
-                key: key.to_string(),
-                base_path: path.clone(),
-                size: meta.size,
-                last_access_at: meta.last_access_at,
-            },
-        );
+        inner
+            .index
+            .insert(key.to_string(), IndexEntry { base_path: path, meta });
         inner.total_size = inner.total_size.saturating_add(size);
         drop(inner);
 
@@ -505,19 +474,23 @@ impl DiskCache {
 
         debug!(target: "cache", current_bytes=inner.total_size, max_bytes=self.max_size, entries=inner.index.len(), "starting eviction");
 
-        let mut candidates: Vec<IndexEntry> = inner.index.values().cloned().collect();
+        let mut candidates: Vec<(String, IndexEntry)> = inner
+            .index
+            .iter()
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
         // LRU eviction: evict entries with the oldest last_access_at first
-        candidates.sort_by_key(|e| e.last_access_at);
+        candidates.sort_by_key(|(_, e)| e.meta.last_access_at);
 
         let mut to_remove = Vec::new();
         let mut projected_total = inner.total_size;
 
-        for entry in candidates {
+        for (key, entry) in candidates {
             if projected_total <= self.max_size {
                 break;
             }
-            to_remove.push(entry.key.clone());
-            projected_total = projected_total.saturating_sub(entry.size);
+            projected_total = projected_total.saturating_sub(entry.meta.size);
+            to_remove.push(key);
         }
 
         for key in &to_remove {

@@ -18,30 +18,13 @@ struct TomlSettings {
     cache: Option<TomlCache>,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
 struct TomlCache {
     dir: Option<String>,
     size: Option<u64>,
     ttl: Option<u64>,
-    policy: Option<String>,
     interval: Option<TomlCacheInterval>,
-    cron: Option<String>,
     body_limit: Option<u64>,
-}
-
-impl Default for TomlCache {
-    fn default() -> Self {
-        Self {
-            dir: Some("cache".into()),
-            size: Some(5 * 1024 * 1024 * 1024), // 5 GB
-            ttl: Some(300),
-            policy: Some("lru".into()),
-            interval: None,
-            cron: None,
-            body_limit: None,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

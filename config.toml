@@ -7,8 +7,6 @@ log = "info"
 dir = "cache"
 size = 10485760
 ttl = 60
-policy = "lru"
-# cron = "0 0 */6 * * * *"
 # body_limit = 5368709120
 
 [settings.cache.interval]

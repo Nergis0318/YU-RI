@@ -32,16 +32,6 @@ pub async fn handle(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    handle_request(req, shared, method, path, start_time).await
-}
-
-async fn handle_request(
-    req: Request<Incoming>,
-    shared: SharedState,
-    method: http::Method,
-    path: String,
-    start_time: Instant,
-) -> Result<Response<BoxedBody>, hyper::Error> {
     let (config, cache, stats) = (&shared.config, &shared.cache, &shared.stats);
 
     if let Some(resp) = try_admin_endpoint(path.as_str(), cache, stats, config).await {

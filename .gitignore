@@ -25,3 +25,5 @@ rustc-ice-*.txt
 
 mcps/
 .fva/
+.claude/
+.commandcode/

@@ -21,7 +21,7 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::{net::TcpListener, sync::broadcast};
 use tracing::{debug, info, warn};
 
-pub use upstream::HttpClient;
+use upstream::HttpClient;
 
 #[derive(Default)]
 pub struct CacheStats {
@@ -143,12 +143,6 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-async fn clear_cache(shared: &SharedState, label: &str) {
-    if let Err(e) = shared.cache.clear_all().await {
-        warn!(error=?e, label, "cache clear failed");
-    }
-}
-
 async fn spawn_cache_clear_tasks(shared: &SharedState) {
     if let Some(interval) = shared.config.cache_clear_interval {
         let shared_clone = shared.clone();
@@ -158,7 +152,9 @@ async fn spawn_cache_clear_tasks(shared: &SharedState) {
             loop {
                 ticker.tick().await;
                 info!(?interval, "Interval cache clear running");
-                clear_cache(&shared_clone, "interval").await;
+                if let Err(e) = shared_clone.cache.clear_all().await {
+                    warn!(error=?e, "cache clear failed");
+                }
             }
         });
         info!(every_secs=%interval.as_secs(), "Cache clear interval enabled");

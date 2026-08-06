@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 bytes = "1"
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-tokio"] }
 http = "1"
@@ -21,10 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 httpdate = "1"
 tokio-stream = "0.1.18"
-lru = "0.18"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "fat"
