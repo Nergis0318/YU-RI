@@ -12,8 +12,6 @@ use tokio::fs as tfs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::warn;
 
-use super::headers::extract_upstream_meta;
-
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 pub const USER_AGENT: &str = concat!("YU-RI/", env!("CARGO_PKG_VERSION"));
@@ -21,21 +19,23 @@ pub const USER_AGENT: &str = concat!("YU-RI/", env!("CARGO_PKG_VERSION"));
 pub fn max_cacheable_body_bytes(config: &Config) -> usize {
     config
         .max_body_bytes
-        .unwrap_or(config.max_cache_size_bytes)
-        .min(usize::MAX as u64) as usize
+        .unwrap_or(config.max_cache_size_bytes) as usize
+}
+
+fn header_str(headers: &HeaderMap, name: &header::HeaderName) -> Option<String> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(String::from)
 }
 
 pub(crate) fn store_options_from_headers(
     headers: &HeaderMap,
     decision: &TtlDecision,
 ) -> CacheStoreOptions {
-    let meta = extract_upstream_meta(headers);
     CacheStoreOptions {
-        content_type: meta.content_type,
+        content_type: header_str(headers, &header::CONTENT_TYPE),
         ttl: decision.ttl,
         swr: decision.stale_while_revalidate,
-        etag: meta.etag,
-        last_modified: meta.last_modified,
+        etag: header_str(headers, &header::ETAG),
+        last_modified: header_str(headers, &header::LAST_MODIFIED),
     }
 }
 
@@ -202,12 +202,11 @@ pub async fn relay_body_with_cache<B>(
 
 pub async fn background_refresh(
     cache_key: String,
-    upstream_url: String,
     config: &Config,
     cache: &DiskCache,
     client: &HttpClient,
 ) -> Result<()> {
-    let upstream_req = build_upstream_request(http::Method::GET, upstream_url.as_str(), None);
+    let upstream_req = build_upstream_request(http::Method::GET, cache_key.as_str(), None);
     let Ok(up_resp) = client.request(upstream_req).await else {
         return Ok(());
     };

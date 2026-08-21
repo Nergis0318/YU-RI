@@ -9,10 +9,6 @@ size = 10485760
 ttl = 60
 # body_limit = 5368709120
 
-[settings.cache.interval]
-enable = false
-time = 300
-
 [upstream]
 url = "https://mirror.xtom.jp"
 

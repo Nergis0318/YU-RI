@@ -23,14 +23,7 @@ struct TomlCache {
     dir: Option<String>,
     size: Option<u64>,
     ttl: Option<u64>,
-    interval: Option<TomlCacheInterval>,
     body_limit: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TomlCacheInterval {
-    enable: Option<bool>,
-    time: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,7 +58,6 @@ pub struct Config {
     pub cache_dir: String,
     pub max_cache_size_bytes: u64,
     pub default_ttl: Duration,
-    pub cache_clear_interval: Option<Duration>,
     pub max_body_bytes: Option<u64>,
 }
 
@@ -90,19 +82,6 @@ impl Config {
         let cache_dir = cache.dir.unwrap_or_else(|| "cache".into());
         let max_cache_size_bytes = cache.size.unwrap_or(5 * 1024 * 1024 * 1024); // 5 GB
         let default_ttl = Duration::from_secs(cache.ttl.unwrap_or(300));
-
-        let cache_clear_interval = cache.interval.and_then(|iv| {
-            if iv.enable.unwrap_or(false) {
-                let secs = iv.time.unwrap_or(0);
-                if secs > 0 {
-                    Some(Duration::from_secs(secs))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
 
         let max_body_bytes = cache.body_limit;
 
@@ -136,7 +115,6 @@ impl Config {
             cache_dir,
             max_cache_size_bytes,
             default_ttl,
-            cache_clear_interval,
             max_body_bytes,
         })
     }
@@ -213,7 +191,6 @@ mod tests {
             cache_dir: "cache".into(),
             max_cache_size_bytes: 1_000_000,
             default_ttl: Duration::from_secs(300),
-            cache_clear_interval: None,
             max_body_bytes: None,
         }
     }

@@ -1,6 +1,6 @@
 use crate::cache::DiskCache;
 use crate::config::Config;
-use crate::http_cache::{TtlDecision, derive_ttl};
+use crate::http_cache::{NOT_CACHEABLE, derive_ttl};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
@@ -12,9 +12,7 @@ use tracing::{info, warn};
 
 use super::CacheStats;
 use super::SharedState;
-use super::headers::{
-    CacheStatus, add_cache_headers, apply_vary_from_response, copy_upstream_headers, vary_cache_key,
-};
+use super::headers::{CacheStatus, add_cache_headers, copy_upstream_headers};
 use super::response::{
     BoxedBody, build_cached_response, empty, full, not_modified_response, parse_range_header,
     simple,
@@ -58,15 +56,8 @@ pub async fn handle(
         .map(|pq| pq.as_str())
         .unwrap_or("");
     let upstream_url = config.resolve_upstream(path_and_query);
-    let base_cache_key = upstream_url.clone();
+    let final_cache_key = upstream_url.clone();
     let range_request = parse_range_header(req.headers());
-
-    let final_cache_key =
-        if let Ok(Some(vary_names)) = cache.get_vary_header_names(&base_cache_key).await {
-            vary_cache_key(&base_cache_key, req.headers(), &vary_names)
-        } else {
-            base_cache_key.clone()
-        };
 
     let if_none_match = req
         .headers()
@@ -84,7 +75,6 @@ pub async fn handle(
             &shared,
             entry,
             &final_cache_key,
-            &base_cache_key,
             &if_none_match,
             if_modified_since,
             range_request,
@@ -119,7 +109,6 @@ pub async fn handle(
         req,
         shared,
         upstream_url,
-        base_cache_key,
         final_cache_key,
         range_request,
         is_head,
@@ -134,8 +123,7 @@ pub async fn handle(
 async fn serve_cache_hit(
     shared: &SharedState,
     entry: crate::cache::CacheFileEntry,
-    final_cache_key: &str,
-    base_cache_key: &str,
+    cache_key: &str,
     if_none_match: &Option<String>,
     if_modified_since: Option<SystemTime>,
     range_request: Option<(u64, Option<u64>)>,
@@ -159,11 +147,7 @@ async fn serve_cache_hit(
     };
 
     if !entry.is_fresh {
-        trigger_background_refresh(
-            shared,
-            final_cache_key.to_string(),
-            base_cache_key.to_string(),
-        );
+        trigger_background_refresh(shared, cache_key.to_string());
     }
 
     log_request(
@@ -185,7 +169,6 @@ async fn try_admin_endpoint(
 ) -> Option<Response<BoxedBody>> {
     match path {
         "/_health" | "/_health/" => Some(simple(StatusCode::OK, "OK")),
-        "/_ready" | "/_ready/" => Some(simple(StatusCode::OK, "READY")),
         "/_stats" | "/_stats/" => {
             let (cache_bytes, cache_entries) = cache.size_info().await;
             let body = serde_json::json!({
@@ -235,13 +218,13 @@ fn etag_precondition_matches(req_inm: &str, entry_etag: &Option<String>) -> bool
         Some(e) => e,
         None => return false,
     };
-    let (_, entry_tag) = parse_entity_tag(entry_etag);
+    let entry_tag = parse_entity_tag(entry_etag);
     for raw in req_inm.split(',') {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
         }
-        let (_, req_tag) = parse_entity_tag(raw);
+        let req_tag = parse_entity_tag(raw);
         if req_tag == entry_tag {
             return true;
         }
@@ -249,22 +232,20 @@ fn etag_precondition_matches(req_inm: &str, entry_etag: &Option<String>) -> bool
     false
 }
 
-fn parse_entity_tag(tag: &str) -> (bool, &str) {
+fn parse_entity_tag(tag: &str) -> &str {
     let tag = tag.trim();
-    let (weak, rest) = if let Some(r) = tag.strip_prefix("W/") {
-        (true, r)
+    let rest = if let Some(r) = tag.strip_prefix("W/") {
+        r
     } else {
-        (false, tag)
+        tag
     };
-    let rest = rest.trim();
-    let rest = rest
+    rest.trim()
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(rest);
-    (weak, rest)
+        .unwrap_or(rest)
 }
 
-fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_url: String) {
+fn trigger_background_refresh(shared: &SharedState, cache_key: String) {
     if !shared
         .refresh_inflight
         .lock()
@@ -275,14 +256,7 @@ fn trigger_background_refresh(shared: &SharedState, cache_key: String, upstream_
     }
     let s = shared.clone();
     tokio::spawn(async move {
-        let _ = background_refresh(
-            cache_key.clone(),
-            upstream_url,
-            &s.config,
-            &s.cache,
-            &s.client,
-        )
-        .await;
+        let _ = background_refresh(cache_key.clone(), &s.config, &s.cache, &s.client).await;
         s.refresh_inflight.lock().unwrap().remove(&cache_key);
     });
 }
@@ -328,7 +302,6 @@ async fn fetch_from_upstream(
     req: Request<Incoming>,
     shared: SharedState,
     upstream_url: String,
-    base_cache_key: String,
     final_cache_key: String,
     range_request: Option<(u64, Option<u64>)>,
     is_head: bool,
@@ -361,29 +334,14 @@ async fn fetch_from_upstream(
             let decision = if status.is_success() {
                 derive_ttl(&headers, std::time::SystemTime::now())
             } else {
-                TtlDecision::not_cacheable()
+                NOT_CACHEABLE
             };
 
-            let vary = apply_vary_from_response(
-                &base_cache_key,
-                &final_cache_key,
-                req.headers(),
-                &headers,
-                decision.cacheable,
-                status == StatusCode::OK,
-            );
-            if !vary.vary_all
-                && status == StatusCode::OK
-                && decision.cacheable
-                && let Some(vary_val) = headers.get(header::VARY).and_then(|v| v.to_str().ok())
-            {
-                let names: Vec<String> = vary_val
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let _ = cache.set_vary_header_names(&base_cache_key, &names).await;
-            }
+            let vary_all = headers
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(',').any(|s| s.trim() == "*"))
+                .unwrap_or(false);
 
             if is_head {
                 let mut resp = Response::new(empty());
@@ -413,16 +371,13 @@ async fn fetch_from_upstream(
             add_cache_headers(resp.headers_mut(), CacheStatus::Miss, 0);
             copy_upstream_headers(resp.headers_mut(), &headers, true);
 
-            let should_cache_body = decision.cacheable
-                && status == StatusCode::OK
-                && range_request.is_none()
-                && !vary.vary_all;
+            let should_cache_body =
+                decision.cacheable && status == StatusCode::OK && range_request.is_none() && !vary_all;
             let max_body_limit = max_cacheable_body_bytes(config) as u64;
             let inflight_key = should_cache_body.then(|| final_cache_key.clone());
 
             let cache_cloned = cache.clone();
             let mut up_body = up_resp.into_body();
-            let variant_key = vary.variant_key.clone();
             let store_options = store_options_from_headers(&headers, &decision);
             let shared_for_inflight = shared.clone();
             let method_for_log = method.clone();
@@ -433,7 +388,7 @@ async fn fetch_from_upstream(
                     &mut up_body,
                     Some(&tx),
                     &cache_cloned,
-                    &variant_key,
+                    &final_cache_key,
                     should_cache_body,
                     max_body_limit,
                     store_options,

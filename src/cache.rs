@@ -25,7 +25,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn walk_cache_dir<F>(root: &Path, mut visit: F) -> Result<()>
+async fn walk_cache_dir<F>(root: &Path, mut visit: F)
 where
     F: FnMut(&Path) + Send,
 {
@@ -49,7 +49,6 @@ where
     for path in &files {
         visit(path);
     }
-    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,7 +100,6 @@ struct CacheInner {
 
 #[derive(Clone)]
 struct IndexEntry {
-    base_path: PathBuf,
     meta: Meta,
 }
 
@@ -199,7 +197,7 @@ impl DiskCache {
                 meta_paths.push(path.to_path_buf());
             }
         })
-        .await?;
+        .await;
 
         let mut index = HashMap::new();
         let mut total = 0u64;
@@ -225,7 +223,7 @@ impl DiskCache {
                 .unwrap_or("")
                 .to_string();
             total += meta.size;
-            index.insert(key, IndexEntry { base_path: base, meta });
+            index.insert(key, IndexEntry { meta });
         }
 
         let mut inner = self.inner.lock().await;
@@ -240,34 +238,12 @@ impl DiskCache {
         (inner.total_size, inner.index.len() as u64)
     }
 
-    /// Clears the entire cache (removes .bin / .meta / .vary files) and resets in-memory state.
-    pub async fn clear_all(&self) -> Result<()> {
-        let mut paths = Vec::new();
-        walk_cache_dir(&self.root, |path| {
-            paths.push(path.to_path_buf());
-        })
-        .await?;
-        for path in paths {
-            let _ = tfs::remove_file(&path).await;
-        }
-
-        let mut inner = self.inner.lock().await;
-        inner.index.clear();
-        inner.total_size = 0;
-        Ok(())
-    }
-
     fn key_path(&self, key: &str) -> PathBuf {
         let mut hasher = blake3::Hasher::new();
         hasher.update(key.as_bytes());
         let hash = hasher.finalize().to_hex().to_string();
         let (a, b) = hash.split_at(2);
         self.root.join(a).join(b)
-    }
-
-    // Path for the Vary index file (.vary extension)
-    fn vary_index_path(&self, base_key: &str) -> PathBuf {
-        self.key_path(base_key).with_extension("vary")
     }
 
     async fn write_file(path: &Path, data: &[u8]) -> Result<()> {
@@ -291,7 +267,7 @@ impl DiskCache {
     /// Remove an entry from the in-memory index and delete its backing files.
     async fn remove_index_entry_locked(&self, key: &str, inner: &mut CacheInner) {
         if let Some(entry) = inner.index.remove(key) {
-            Self::remove_entry_files(&entry.base_path).await;
+            Self::remove_entry_files(&self.key_path(key)).await;
             inner.total_size = inner.total_size.saturating_sub(entry.meta.size);
         }
     }
@@ -454,9 +430,7 @@ impl DiskCache {
             return Err(e.into());
         }
 
-        inner
-            .index
-            .insert(key.to_string(), IndexEntry { base_path: path, meta });
+        inner.index.insert(key.to_string(), IndexEntry { meta });
         inner.total_size = inner.total_size.saturating_add(size);
         drop(inner);
 
@@ -498,34 +472,6 @@ impl DiskCache {
         }
 
         debug!(target: "cache", final_bytes=inner.total_size, "eviction complete");
-        Ok(())
-    }
-
-    // Returns the list of Vary header names for a base key, or None if absent/invalid.
-    pub async fn get_vary_header_names(&self, base_key: &str) -> Result<Option<Vec<String>>> {
-        let path = self.vary_index_path(base_key);
-        if tfs::metadata(&path).await.is_err() {
-            return Ok(None);
-        }
-        let bytes = match tfs::read(&path).await {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let names: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
-        if names.is_empty() || names.iter().any(|name| name == "*") {
-            return Ok(None);
-        }
-        Ok(Some(names))
-    }
-
-    // Stores the list of Vary header names for a base key, overwriting any previous value.
-    pub async fn set_vary_header_names(&self, base_key: &str, names: &[String]) -> Result<()> {
-        if names.is_empty() {
-            return Ok(());
-        }
-        let path = self.vary_index_path(base_key);
-        let data = serde_json::to_vec(names)?;
-        Self::write_file(&path, &data).await?;
         Ok(())
     }
 }

@@ -10,30 +10,6 @@ pub struct TtlDecision {
     pub stale_while_revalidate: Option<Duration>, // stale-while-revalidate=N support
 }
 
-impl TtlDecision {
-    pub fn not_cacheable() -> Self {
-        Self {
-            ttl: None,
-            cacheable: false,
-            stale_while_revalidate: None,
-        }
-    }
-    pub fn with_ttl(d: Duration) -> Self {
-        Self {
-            ttl: Some(d),
-            cacheable: true,
-            stale_while_revalidate: None,
-        }
-    }
-    pub fn default_cacheable() -> Self {
-        Self {
-            ttl: None,
-            cacheable: true,
-            stale_while_revalidate: None,
-        }
-    }
-}
-
 /// Parses Cache-Control / Expires headers to derive a TTL.
 /// Simplified rules:
 /// 1. If Cache-Control is present, it takes precedence.
@@ -57,7 +33,7 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
             if token == "no-store" || token == "no-cache" || token == "private" {
                 // "private" is treated as non-cacheable for a shared cache.
                 debug!(target: "http_cache", directive = token, "Cache-Control directive forces non-cacheable");
-                return TtlDecision::not_cacheable();
+                return NOT_CACHEABLE;
             }
             if let Some(rest) = token.strip_prefix("s-maxage=") {
                 if let Ok(v) = rest.parse::<i64>() {
@@ -77,9 +53,13 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
         if let Some(sec) = chosen {
             if sec == 0 {
                 debug!(target: "http_cache", ttl = sec, "Chosen TTL is zero => non-cacheable");
-                return TtlDecision::not_cacheable();
+                return NOT_CACHEABLE;
             }
-            let mut d = TtlDecision::with_ttl(Duration::from_secs(sec as u64));
+            let mut d = TtlDecision {
+                ttl: Some(Duration::from_secs(sec as u64)),
+                cacheable: true,
+                stale_while_revalidate: None,
+            };
             if let Some(s) = swr
                 && s > 0
             {
@@ -99,19 +79,33 @@ pub fn derive_ttl(headers: &HeaderMap, now: SystemTime) -> TtlDecision {
         if let Ok(diff) = exp_time.duration_since(now) {
             if diff.as_secs() == 0 {
                 debug!(target: "http_cache", expires = exp_val, "Expires header is now => non-cacheable");
-                return TtlDecision::not_cacheable();
+                return NOT_CACHEABLE;
             }
             debug!(target: "http_cache", expires = exp_val, ttl_secs = diff.as_secs(), "Derived TTL from Expires header");
-            return TtlDecision::with_ttl(diff);
+            return TtlDecision {
+                ttl: Some(diff),
+                cacheable: true,
+                stale_while_revalidate: None,
+            };
         } else {
             debug!(target: "http_cache", expires = exp_val, "Expires header is in the past => non-cacheable");
-            return TtlDecision::not_cacheable();
+            return NOT_CACHEABLE;
         }
     }
     // Default cacheable policy
     debug!(target: "http_cache", "No explicit TTL headers => using default cacheable policy");
-    TtlDecision::default_cacheable()
+    TtlDecision {
+        ttl: None,
+        cacheable: true,
+        stale_while_revalidate: None,
+    }
 }
+
+pub const NOT_CACHEABLE: TtlDecision = TtlDecision {
+    ttl: None,
+    cacheable: false,
+    stale_while_revalidate: None,
+};
 
 #[cfg(test)]
 mod tests {

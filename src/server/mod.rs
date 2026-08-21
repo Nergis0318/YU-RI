@@ -84,9 +84,6 @@ pub async fn run(config: Config) -> Result<()> {
         inflight: Arc::new(Mutex::new(HashMap::new())),
         refresh_inflight: Arc::new(Mutex::new(HashSet::new())),
     });
-
-    spawn_cache_clear_tasks(&shared).await;
-
     let addr = shared.config.listen_addr.clone();
     let listener = TcpListener::bind(&addr).await?;
     info!(?addr, "Listening");
@@ -141,24 +138,6 @@ pub async fn run(config: Config) -> Result<()> {
 
     info!("Server shutdown complete");
     Ok(())
-}
-
-async fn spawn_cache_clear_tasks(shared: &SharedState) {
-    if let Some(interval) = shared.config.cache_clear_interval {
-        let shared_clone = shared.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                info!(?interval, "Interval cache clear running");
-                if let Err(e) = shared_clone.cache.clear_all().await {
-                    warn!(error=?e, "cache clear failed");
-                }
-            }
-        });
-        info!(every_secs=%interval.as_secs(), "Cache clear interval enabled");
-    }
 }
 
 async fn shutdown_signal() {
